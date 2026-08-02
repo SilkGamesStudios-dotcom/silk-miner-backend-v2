@@ -16,6 +16,17 @@ def verificar_admin(x_admin_password: str = Header(None)):
         raise HTTPException(401, "No autorizado")
     return True
 
+
+def hash_pw(password: str) -> str:
+    return hashlib.sha256((password or "").encode()).hexdigest()
+
+
+def verificar_password(usuario, password: str):
+    if not usuario.password_hash:
+        return
+    if hash_pw(password) != usuario.password_hash:
+        raise HTTPException(401, "Contraseña incorrecta")
+
 app = FastAPI(title="Miner Backend")
 init_db()
 
@@ -100,11 +111,13 @@ def cumple_dificultad(hash_hex: str, dificultad: int) -> bool:
 
 # ---------- REGISTRO ----------
 @app.post("/register")
-def register_rig(mac: str, usuario_id: str, nombre: str = None, db: Session = Depends(get_db)):
+def register_rig(mac: str, usuario_id: str, password: str, nombre: str = None, db: Session = Depends(get_db)):
     usuario = db.get(Usuario, usuario_id)
     if not usuario:
-        usuario = Usuario(id=usuario_id, nombre=nombre or usuario_id, oro_saldo=0, oro_historico=0)
+        usuario = Usuario(id=usuario_id, nombre=nombre or usuario_id, oro_saldo=0, oro_historico=0, password_hash=hash_pw(password))
         db.add(usuario)
+    else:
+        verificar_password(usuario, password)
 
     if db.get(Rig, mac):
         raise HTTPException(400, "MAC ya registrada")
@@ -115,13 +128,23 @@ def register_rig(mac: str, usuario_id: str, nombre: str = None, db: Session = De
     return {"status": "registrado", "mac": mac}
 
 
+@app.post("/login")
+def login(usuario_id: str, password: str, db: Session = Depends(get_db)):
+    usuario = db.get(Usuario, usuario_id)
+    if not usuario:
+        raise HTTPException(404, "Usuario no existe todavía (regístralo con un ESP32 primero)")
+    verificar_password(usuario, password)
+    return {"status": "ok"}
+
+
 @app.post("/rig/renombrar")
-def renombrar_rig(mac: str, usuario_id: str, nuevo_nombre: str, db: Session = Depends(get_db)):
+def renombrar_rig(mac: str, usuario_id: str, nuevo_nombre: str, password: str, db: Session = Depends(get_db)):
     rig = db.get(Rig, mac)
     if not rig:
         raise HTTPException(404, "Rig no encontrado")
     if rig.usuario_id != usuario_id:
         raise HTTPException(403, "Este rig no te pertenece")
+    verificar_password(db.get(Usuario, usuario_id), password)
     if not nuevo_nombre.strip():
         raise HTTPException(400, "Nombre inválido")
     if len(nuevo_nombre) > 30:
@@ -220,7 +243,8 @@ def descontar_dia_electricidad(db: Session = Depends(get_db), _admin: bool = Dep
 BINANCE_PAY_ID = "748095851"
 
 @app.post("/electricidad/solicitar_paquete")
-def solicitar_paquete(usuario_id: str, paquete_id: str, db: Session = Depends(get_db)):
+def solicitar_paquete(usuario_id: str, paquete_id: str, password: str, db: Session = Depends(get_db)):
+    verificar_password(db.get(Usuario, usuario_id), password)
     if paquete_id not in PAQUETES_ELECTRICIDAD:
         raise HTTPException(400, "Paquete inválido")
     paquete = PAQUETES_ELECTRICIDAD[paquete_id]
@@ -333,7 +357,11 @@ def rechazar_orden(orden_id: str, db: Session = Depends(get_db), _admin: bool = 
 
 # ---------- CRAFTEO ----------
 @app.post("/craftear")
-def craftear(usuario_id: str, receta_id: str, db: Session = Depends(get_db)):
+def craftear(usuario_id: str, receta_id: str, password: str, db: Session = Depends(get_db)):
+    usuario = db.get(Usuario, usuario_id)
+    if not usuario:
+        raise HTTPException(404, "Usuario no existe")
+    verificar_password(usuario, password)
     if receta_id not in RECETAS:
         raise HTTPException(400, "Receta inválida")
     receta = RECETAS[receta_id]
@@ -354,7 +382,8 @@ def craftear(usuario_id: str, receta_id: str, db: Session = Depends(get_db)):
 
 # ---------- MERCADO ----------
 @app.post("/mercado/publicar")
-def publicar_orden(usuario_id: str, tipo_item: str, item_id: str, cantidad: int, precio_oro: float, db: Session = Depends(get_db)):
+def publicar_orden(usuario_id: str, tipo_item: str, item_id: str, cantidad: int, precio_oro: float, password: str, db: Session = Depends(get_db)):
+    verificar_password(db.get(Usuario, usuario_id), password)
     if precio_oro <= 0 or cantidad <= 0:
         raise HTTPException(400, "Cantidad/precio inválidos")
 
@@ -372,7 +401,8 @@ def publicar_orden(usuario_id: str, tipo_item: str, item_id: str, cantidad: int,
 
 
 @app.post("/mercado/comprar")
-def comprar_orden(usuario_id: str, orden_id: int, db: Session = Depends(get_db)):
+def comprar_orden(usuario_id: str, orden_id: int, password: str, db: Session = Depends(get_db)):
+    verificar_password(db.get(Usuario, usuario_id), password)
     orden = db.get(OrdenMercado, orden_id)
     if not orden or orden.estado != "abierta":
         raise HTTPException(400, "Orden no disponible")
@@ -402,7 +432,8 @@ def comprar_orden(usuario_id: str, orden_id: int, db: Session = Depends(get_db))
 
 
 @app.post("/mercado/cancelar")
-def cancelar_orden(usuario_id: str, orden_id: int, db: Session = Depends(get_db)):
+def cancelar_orden(usuario_id: str, orden_id: int, password: str, db: Session = Depends(get_db)):
+    verificar_password(db.get(Usuario, usuario_id), password)
     orden = db.get(OrdenMercado, orden_id)
     if not orden or orden.usuario_id != usuario_id:
         raise HTTPException(403, "No autorizado")
@@ -479,10 +510,11 @@ def ranking(limite: int = 100, db: Session = Depends(get_db)):
 
 # ---------- PERFIL / INVENTARIO ----------
 @app.get("/perfil/{usuario_id}")
-def perfil(usuario_id: str, db: Session = Depends(get_db)):
+def perfil(usuario_id: str, password: str, db: Session = Depends(get_db)):
     usuario = db.get(Usuario, usuario_id)
     if not usuario:
         raise HTTPException(404, "Usuario no existe")
+    verificar_password(usuario, password)
     minerales = db.query(MineralInventario).filter_by(usuario_id=usuario_id).all()
     piezas = db.query(PiezaInstalada).filter_by(usuario_id=usuario_id).all()
     rigs = db.query(Rig).filter_by(usuario_id=usuario_id).all()
