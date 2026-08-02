@@ -12,6 +12,7 @@ class Usuario(Base):
     id = Column(String, primary_key=True)
     nombre = Column(String, unique=True)
     wallet = Column(String, nullable=True)
+    password_hash = Column(String, nullable=True)
     oro_saldo = Column(Float, default=0)
     oro_historico = Column(Float, default=0)
 
