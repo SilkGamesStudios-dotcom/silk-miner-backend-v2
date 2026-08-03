@@ -299,7 +299,7 @@ def solicitar_paquete(usuario_id: str, paquete_id: str, cantidad_rigs: int, pass
         "orden_id": orden_id,
         "binance_pay_id": BINANCE_PAY_ID,
         "monto_a_pagar_usdt": costo_total_usdt,
-        "rigs_afectados": len(rigs),
+        "rigs_afectados": cantidad_rigs,
         "dias_por_rig": paquete["dias"],
         "siguiente_paso": "Sube el comprobante con /electricidad/subir_comprobante",
     }
