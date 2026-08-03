@@ -1,12 +1,14 @@
 import hashlib, random, uuid, json, os
 from datetime import datetime, timedelta
+from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from models import SessionLocal, init_db, Usuario, Rig, MineralInventario, PiezaInstalada, OrdenMercado, OrdenElectricidad
+from models import SessionLocal, init_db, Usuario, Rig, RigGrupo, MineralInventario, PiezaInstalada, OrdenMercado, OrdenElectricidad
 from reglas import MINERALES, RECETAS, DIFICULTAD_DISPOSITIVO, RECOMPENSA_POR_SHARE, META_ORO_SEMANAL, COSTO_DIARIO_USDT, ROTACION_JOB_SEGUNDOS, PAQUETES_ELECTRICIDAD, calcular_nivel
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "SilkAdmin41")
@@ -17,15 +19,20 @@ def verificar_admin(x_admin_password: str = Header(None)):
     return True
 
 
-def hash_pw(password: str) -> str:
-    return hashlib.sha256((password or "").encode()).hexdigest()
-
-
-def verificar_password(usuario, password: str):
-    if not usuario.password_hash:
-        return
-    if hash_pw(password) != usuario.password_hash:
-        raise HTTPException(401, "Contraseña incorrecta")
+def verificar_usuario(usuario_id: str, password: str, db: Session) -> Usuario:
+    """Si el usuario no tiene password todavía, la primera que mande queda fijada.
+    Si ya tiene una, debe coincidir."""
+    usuario = db.get(Usuario, usuario_id)
+    if not usuario:
+        raise HTTPException(404, "Usuario no existe")
+    if not password:
+        raise HTTPException(401, "Falta password")
+    if usuario.password is None:
+        usuario.password = password
+        db.commit()
+    elif usuario.password != password:
+        raise HTTPException(401, "Password incorrecta")
+    return usuario
 
 app = FastAPI(title="Miner Backend")
 init_db()
@@ -111,13 +118,11 @@ def cumple_dificultad(hash_hex: str, dificultad: int) -> bool:
 
 # ---------- REGISTRO ----------
 @app.post("/register")
-def register_rig(mac: str, usuario_id: str, password: str, nombre: str = None, db: Session = Depends(get_db)):
+def register_rig(mac: str, usuario_id: str, nombre: str = None, db: Session = Depends(get_db)):
     usuario = db.get(Usuario, usuario_id)
     if not usuario:
-        usuario = Usuario(id=usuario_id, nombre=nombre or usuario_id, oro_saldo=0, oro_historico=0, password_hash=hash_pw(password))
+        usuario = Usuario(id=usuario_id, nombre=nombre or usuario_id, oro_saldo=0, oro_historico=0)
         db.add(usuario)
-    else:
-        verificar_password(usuario, password)
 
     if db.get(Rig, mac):
         raise HTTPException(400, "MAC ya registrada")
@@ -128,23 +133,14 @@ def register_rig(mac: str, usuario_id: str, password: str, nombre: str = None, d
     return {"status": "registrado", "mac": mac}
 
 
-@app.post("/login")
-def login(usuario_id: str, password: str, db: Session = Depends(get_db)):
-    usuario = db.get(Usuario, usuario_id)
-    if not usuario:
-        raise HTTPException(404, "Usuario no existe todavía (regístralo con un ESP32 primero)")
-    verificar_password(usuario, password)
-    return {"status": "ok"}
-
-
 @app.post("/rig/renombrar")
-def renombrar_rig(mac: str, usuario_id: str, nuevo_nombre: str, password: str, db: Session = Depends(get_db)):
+def renombrar_rig(mac: str, usuario_id: str, nuevo_nombre: str, password: str = None, db: Session = Depends(get_db)):
+    verificar_usuario(usuario_id, password, db)
     rig = db.get(Rig, mac)
     if not rig:
         raise HTTPException(404, "Rig no encontrado")
     if rig.usuario_id != usuario_id:
         raise HTTPException(403, "Este rig no te pertenece")
-    verificar_password(db.get(Usuario, usuario_id), password)
     if not nuevo_nombre.strip():
         raise HTTPException(400, "Nombre inválido")
     if len(nuevo_nombre) > 30:
@@ -153,6 +149,39 @@ def renombrar_rig(mac: str, usuario_id: str, nuevo_nombre: str, password: str, d
     rig.nombre = nuevo_nombre.strip()
     db.commit()
     return {"status": "ok", "mac": mac, "nombre": rig.nombre}
+
+
+# ---------- AGRUPACIÓN: crear un rig (contenedor de hasta 6 ESP32) ----------
+@app.post("/rig/crear")
+def crear_rig_grupo(usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+    verificar_usuario(usuario_id, password, db)
+    existentes = db.query(RigGrupo).filter_by(usuario_id=usuario_id).all()
+    siguiente_id = str(max([int(r.id) for r in existentes], default=0) + 1)
+    grupo = RigGrupo(id=siguiente_id, usuario_id=usuario_id, nombre=f"Rig {siguiente_id}")
+    db.add(grupo)
+    db.commit()
+    return {"rig_id": grupo.id, "nombre": grupo.nombre}
+
+
+# ---------- AGRUPACIÓN: asignar un ESP32 a un rig (máx 6 por rig) ----------
+@app.post("/rig/asignar_esp32")
+def asignar_esp32(mac: str, rig_id: str, usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+    verificar_usuario(usuario_id, password, db)
+    dispositivo = db.get(Rig, mac)
+    if not dispositivo or dispositivo.usuario_id != usuario_id:
+        raise HTTPException(404, "ESP32 no encontrado o no te pertenece")
+
+    grupo = db.query(RigGrupo).filter_by(id=rig_id, usuario_id=usuario_id).first()
+    if not grupo:
+        raise HTTPException(404, "Rig no encontrado")
+
+    cantidad_actual = db.query(Rig).filter_by(rig_id=rig_id, usuario_id=usuario_id).count()
+    if cantidad_actual >= 6:
+        raise HTTPException(400, "Ese rig ya tiene 6 ESP32 (máximo)")
+
+    dispositivo.rig_id = rig_id
+    db.commit()
+    return {"status": "ok", "mac": mac, "rig_id": rig_id}
 
 
 # ---------- JOB ----------
@@ -243,22 +272,24 @@ def descontar_dia_electricidad(db: Session = Depends(get_db), _admin: bool = Dep
 BINANCE_PAY_ID = "748095851"
 
 @app.post("/electricidad/solicitar_paquete")
-def solicitar_paquete(usuario_id: str, paquete_id: str, password: str, db: Session = Depends(get_db)):
-    verificar_password(db.get(Usuario, usuario_id), password)
+def solicitar_paquete(usuario_id: str, paquete_id: str, cantidad_rigs: int, password: str = None, db: Session = Depends(get_db)):
+    verificar_usuario(usuario_id, password, db)
     if paquete_id not in PAQUETES_ELECTRICIDAD:
         raise HTTPException(400, "Paquete inválido")
     paquete = PAQUETES_ELECTRICIDAD[paquete_id]
 
-    rigs = db.query(Rig).filter_by(usuario_id=usuario_id, activo=True).all()
-    if not rigs:
-        raise HTTPException(400, "No tienes rigs activos")
+    total_esp32 = db.query(Rig).filter_by(usuario_id=usuario_id, activo=True).count()
+    if total_esp32 == 0:
+        raise HTTPException(400, "No tienes ESP32 activos")
+    if cantidad_rigs <= 0 or cantidad_rigs > total_esp32:
+        raise HTTPException(400, f"Cantidad inválida (tenés {total_esp32} ESP32 conectados)")
 
-    costo_total_usdt = round(paquete["precio_usdt_por_esp32"] * len(rigs), 2)
+    costo_total_usdt = round(paquete["precio_usdt_por_esp32"] * cantidad_rigs, 2)
     orden_id = f"elec_{usuario_id}_{uuid.uuid4().hex[:10]}"
 
     orden = OrdenElectricidad(
         id=orden_id, usuario_id=usuario_id, paquete_id=paquete_id,
-        cantidad_rigs=len(rigs), dias_por_rig=paquete["dias"],
+        cantidad_rigs=cantidad_rigs, dias_por_rig=paquete["dias"],
         monto_usdt=costo_total_usdt, estado="pendiente_revision",
     )
     db.add(orden)
@@ -329,7 +360,13 @@ def aprobar_orden(orden_id: str, db: Session = Depends(get_db), _admin: bool = D
     if orden.estado != "pendiente_revision":
         raise HTTPException(400, "Orden ya procesada")
 
-    rigs = db.query(Rig).filter_by(usuario_id=orden.usuario_id, activo=True).all()
+    rigs = (
+        db.query(Rig)
+        .filter_by(usuario_id=orden.usuario_id, activo=True)
+        .order_by(Rig.dias_electricidad_prepagados.asc())
+        .limit(orden.cantidad_rigs)
+        .all()
+    )
     for rig in rigs:
         rig.dias_electricidad_prepagados += orden.dias_por_rig
 
@@ -357,11 +394,8 @@ def rechazar_orden(orden_id: str, db: Session = Depends(get_db), _admin: bool = 
 
 # ---------- CRAFTEO ----------
 @app.post("/craftear")
-def craftear(usuario_id: str, receta_id: str, password: str, db: Session = Depends(get_db)):
-    usuario = db.get(Usuario, usuario_id)
-    if not usuario:
-        raise HTTPException(404, "Usuario no existe")
-    verificar_password(usuario, password)
+def craftear(usuario_id: str, receta_id: str, password: str = None, db: Session = Depends(get_db)):
+    verificar_usuario(usuario_id, password, db)
     if receta_id not in RECETAS:
         raise HTTPException(400, "Receta inválida")
     receta = RECETAS[receta_id]
@@ -382,8 +416,8 @@ def craftear(usuario_id: str, receta_id: str, password: str, db: Session = Depen
 
 # ---------- MERCADO ----------
 @app.post("/mercado/publicar")
-def publicar_orden(usuario_id: str, tipo_item: str, item_id: str, cantidad: int, precio_oro: float, password: str, db: Session = Depends(get_db)):
-    verificar_password(db.get(Usuario, usuario_id), password)
+def publicar_orden(usuario_id: str, tipo_item: str, item_id: str, cantidad: int, precio_oro: float, password: str = None, db: Session = Depends(get_db)):
+    verificar_usuario(usuario_id, password, db)
     if precio_oro <= 0 or cantidad <= 0:
         raise HTTPException(400, "Cantidad/precio inválidos")
 
@@ -401,8 +435,8 @@ def publicar_orden(usuario_id: str, tipo_item: str, item_id: str, cantidad: int,
 
 
 @app.post("/mercado/comprar")
-def comprar_orden(usuario_id: str, orden_id: int, password: str, db: Session = Depends(get_db)):
-    verificar_password(db.get(Usuario, usuario_id), password)
+def comprar_orden(usuario_id: str, orden_id: int, password: str = None, db: Session = Depends(get_db)):
+    verificar_usuario(usuario_id, password, db)
     orden = db.get(OrdenMercado, orden_id)
     if not orden or orden.estado != "abierta":
         raise HTTPException(400, "Orden no disponible")
@@ -432,8 +466,7 @@ def comprar_orden(usuario_id: str, orden_id: int, password: str, db: Session = D
 
 
 @app.post("/mercado/cancelar")
-def cancelar_orden(usuario_id: str, orden_id: int, password: str, db: Session = Depends(get_db)):
-    verificar_password(db.get(Usuario, usuario_id), password)
+def cancelar_orden(usuario_id: str, orden_id: int, db: Session = Depends(get_db)):
     orden = db.get(OrdenMercado, orden_id)
     if not orden or orden.usuario_id != usuario_id:
         raise HTTPException(403, "No autorizado")
@@ -510,19 +543,133 @@ def ranking(limite: int = 100, db: Session = Depends(get_db)):
 
 # ---------- PERFIL / INVENTARIO ----------
 @app.get("/perfil/{usuario_id}")
-def perfil(usuario_id: str, password: str, db: Session = Depends(get_db)):
+def perfil(usuario_id: str, db: Session = Depends(get_db)):
     usuario = db.get(Usuario, usuario_id)
     if not usuario:
         raise HTTPException(404, "Usuario no existe")
-    verificar_password(usuario, password)
     minerales = db.query(MineralInventario).filter_by(usuario_id=usuario_id).all()
     piezas = db.query(PiezaInstalada).filter_by(usuario_id=usuario_id).all()
-    rigs = db.query(Rig).filter_by(usuario_id=usuario_id).all()
+    dispositivos = db.query(Rig).filter_by(usuario_id=usuario_id).all()
+    grupos = db.query(RigGrupo).filter_by(usuario_id=usuario_id).all()
+
+    def esp32_dict(r):
+        return {"mac": r.mac, "nombre": r.nombre or r.mac, "activo": r.activo, "dias_electricidad": r.dias_electricidad_prepagados}
+
+    rigs_agrupados = []
+    for g in grupos:
+        esp32_del_grupo = [esp32_dict(r) for r in dispositivos if r.rig_id == g.id]
+        rigs_agrupados.append({"rig_id": g.id, "nombre": g.nombre, "esp32": esp32_del_grupo})
+
+    sin_asignar = [esp32_dict(r) for r in dispositivos if r.rig_id is None]
+
     return {
         "usuario": usuario.nombre,
         "oro_saldo": usuario.oro_saldo,
         "nivel": calcular_nivel(usuario.oro_historico)["nombre"],
         "minerales": {m.mineral: m.cantidad for m in minerales},
         "piezas": [p.pieza_id for p in piezas],
-        "rigs": [{"mac": r.mac, "nombre": r.nombre or r.mac, "activo": r.activo, "dias_electricidad": r.dias_electricidad_prepagados} for r in rigs],
+        "rigs": rigs_agrupados,
+        "esp32_sin_asignar": sin_asignar,
+    }
+
+
+# ---------- TRANSFERENCIA DIRECTA ENTRE USUARIOS (Oro + hasta 6 ítems) ----------
+class ItemTransferencia(BaseModel):
+    tipo: str      # "mineral" o "pieza"
+    item_id: str
+    cantidad: int
+
+
+class TransferenciaRequest(BaseModel):
+    usuario_id: str
+    password: str
+    destino_usuario_id: str
+    oro: float = 0
+    items: List[ItemTransferencia] = []
+
+
+@app.post("/transferir")
+def transferir(req: TransferenciaRequest, db: Session = Depends(get_db)):
+    verificar_usuario(req.usuario_id, req.password, db)
+
+    if req.usuario_id == req.destino_usuario_id:
+        raise HTTPException(400, "No podés transferirte a vos mismo")
+
+    destino = db.get(Usuario, req.destino_usuario_id)
+    if not destino:
+        raise HTTPException(404, "El usuario destino no existe")
+
+    if len(req.items) > 6:
+        raise HTTPException(400, "Máximo 6 ítems por transferencia")
+
+    origen = db.get(Usuario, req.usuario_id)
+
+    if req.oro < 0:
+        raise HTTPException(400, "Cantidad de Oro inválida")
+    if req.oro > 0 and origen.oro_saldo < req.oro:
+        raise HTTPException(400, "No tenés suficiente Oro")
+
+    # Validar inventario ANTES de mover nada (para que sea todo o nada)
+    for item in req.items:
+        if item.cantidad <= 0:
+            raise HTTPException(400, f"Cantidad inválida para {item.item_id}")
+        if item.tipo == "mineral":
+            inv = db.query(MineralInventario).filter_by(usuario_id=req.usuario_id, mineral=item.item_id).first()
+            if not inv or inv.cantidad < item.cantidad:
+                raise HTTPException(400, f"No tenés suficiente {item.item_id}")
+        elif item.tipo == "pieza":
+            disponibles = db.query(PiezaInstalada).filter_by(usuario_id=req.usuario_id, pieza_id=item.item_id).count()
+            if disponibles < item.cantidad:
+                raise HTTPException(400, f"No tenés suficientes piezas {item.item_id}")
+        else:
+            raise HTTPException(400, f"Tipo de ítem inválido: {item.tipo}")
+
+    # Ejecutar la transferencia completa
+    if req.oro > 0:
+        origen.oro_saldo -= req.oro
+        destino.oro_saldo += req.oro
+
+    for item in req.items:
+        if item.tipo == "mineral":
+            inv_origen = db.query(MineralInventario).filter_by(usuario_id=req.usuario_id, mineral=item.item_id).first()
+            inv_origen.cantidad -= item.cantidad
+
+            inv_destino = db.query(MineralInventario).filter_by(usuario_id=req.destino_usuario_id, mineral=item.item_id).first()
+            if not inv_destino:
+                inv_destino = MineralInventario(usuario_id=req.destino_usuario_id, mineral=item.item_id, cantidad=0)
+                db.add(inv_destino)
+            inv_destino.cantidad += item.cantidad
+        elif item.tipo == "pieza":
+            piezas_a_mover = db.query(PiezaInstalada).filter_by(usuario_id=req.usuario_id, pieza_id=item.item_id).limit(item.cantidad).all()
+            for p in piezas_a_mover:
+                p.usuario_id = req.destino_usuario_id
+
+    db.commit()
+    return {
+        "status": "ok",
+        "de": req.usuario_id,
+        "para": req.destino_usuario_id,
+        "oro_transferido": req.oro,
+        "items_transferidos": [i.dict() for i in req.items],
+    }
+
+
+# ---------- INVENTARIO detallado (para armar los slots de transferencia) ----------
+@app.get("/inventario/{usuario_id}")
+def inventario(usuario_id: str, db: Session = Depends(get_db)):
+    usuario = db.get(Usuario, usuario_id)
+    if not usuario:
+        raise HTTPException(404, "Usuario no existe")
+
+    minerales = db.query(MineralInventario).filter_by(usuario_id=usuario_id).all()
+    piezas = db.query(PiezaInstalada).filter_by(usuario_id=usuario_id).all()
+
+    piezas_agrupadas = {}
+    for p in piezas:
+        piezas_agrupadas[p.pieza_id] = piezas_agrupadas.get(p.pieza_id, 0) + 1
+
+    return {
+        "oro_saldo": usuario.oro_saldo,
+        "minerales": {m.mineral: m.cantidad for m in minerales if m.cantidad > 0},
+        "piezas": piezas_agrupadas,
     }
