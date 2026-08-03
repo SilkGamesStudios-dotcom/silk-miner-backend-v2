@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from models import SessionLocal, init_db, Usuario, Rig, RigGrupo, MineralInventario, PiezaInstalada, OrdenMercado, OrdenElectricidad
-from reglas import MINERALES, RECETAS, DIFICULTAD_DISPOSITIVO, RECOMPENSA_POR_SHARE, META_ORO_SEMANAL, COSTO_DIARIO_USDT, ROTACION_JOB_SEGUNDOS, PAQUETES_ELECTRICIDAD, calcular_nivel
+from reglas import MINERALES, RECETAS, SLOTS_RIG, BONUS_RIG_COMPLETO, DIFICULTAD_DISPOSITIVO, RECOMPENSA_POR_SHARE, META_ORO_SEMANAL, COSTO_DIARIO_USDT, ROTACION_JOB_SEGUNDOS, PAQUETES_ELECTRICIDAD, calcular_nivel
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "SilkAdmin41")
 
@@ -118,11 +118,23 @@ def cumple_dificultad(hash_hex: str, dificultad: int) -> bool:
 
 # ---------- REGISTRO ----------
 @app.post("/register")
-def register_rig(mac: str, usuario_id: str, nombre: str = None, db: Session = Depends(get_db)):
+def register_rig(mac: str, usuario_id: str, password: str, nombre: str = None, db: Session = Depends(get_db)):
+    if not password:
+        raise HTTPException(401, "Falta password")
+
     usuario = db.get(Usuario, usuario_id)
     if not usuario:
-        usuario = Usuario(id=usuario_id, nombre=nombre or usuario_id, oro_saldo=0, oro_historico=0)
+        # Cuenta nueva: la contraseña queda fijada en el mismo instante en que se crea,
+        # sin ventana de tiempo en la que otro pueda "robarla" fijando la suya primero.
+        usuario = Usuario(id=usuario_id, nombre=nombre or usuario_id, oro_saldo=0, oro_historico=0, password=password)
         db.add(usuario)
+        db.commit()
+    elif usuario.password is None:
+        # Cuenta creada antes de este arreglo (sin password todavía): se fija ahora.
+        usuario.password = password
+        db.commit()
+    elif usuario.password != password:
+        raise HTTPException(401, "Password incorrecta: esta cuenta ya tiene dueño")
 
     if db.get(Rig, mac):
         raise HTTPException(400, "MAC ya registrada")
@@ -219,10 +231,18 @@ def submit_share(mac: str, job_id: str, nonce: int, hash_result: str, db: Sessio
     shares_por_job.setdefault(job_id, set()).add(mac)
 
     usuario = db.get(Usuario, rig.usuario_id)
-    buff = sum(
-        RECETAS[p.pieza_id]["buff_hashrate"]
-        for p in db.query(PiezaInstalada).filter_by(usuario_id=usuario.id).all()
-    )
+
+    buff = 0.0
+    if rig.rig_id:
+        piezas_del_rig = db.query(PiezaInstalada).filter_by(usuario_id=usuario.id, rig_id=rig.rig_id).all()
+        piezas_activas = [p for p in piezas_del_rig if p.durabilidad_actual > 0]
+        buff = sum(RECETAS[p.pieza_id]["buff_hashrate"] for p in piezas_activas)
+        slots_llenos = {p.slot for p in piezas_activas}
+        if len(slots_llenos) >= len(SLOTS_RIG):
+            buff += BONUS_RIG_COMPLETO
+        for p in piezas_activas:
+            p.durabilidad_actual = max(0, p.durabilidad_actual - 1)
+
     recompensa = estado_recompensa["valor"] * (1 + buff)
     usuario.oro_saldo += recompensa
     usuario.oro_historico += recompensa
@@ -409,7 +429,10 @@ def craftear(usuario_id: str, receta_id: str, password: str = None, db: Session 
         inv = db.query(MineralInventario).filter_by(usuario_id=usuario_id, mineral=mineral).first()
         inv.cantidad -= cantidad
 
-    db.add(PiezaInstalada(usuario_id=usuario_id, pieza_id=receta_id))
+    db.add(PiezaInstalada(
+        usuario_id=usuario_id, pieza_id=receta_id, slot=receta["slot"],
+        rig_id=None, durabilidad_actual=receta["durabilidad_max"],
+    ))
     db.commit()
     return {"status": "ok", "pieza": receta_id, "buff": receta["buff_hashrate"]}
 
@@ -543,10 +566,8 @@ def ranking(limite: int = 100, db: Session = Depends(get_db)):
 
 # ---------- PERFIL / INVENTARIO ----------
 @app.get("/perfil/{usuario_id}")
-def perfil(usuario_id: str, db: Session = Depends(get_db)):
-    usuario = db.get(Usuario, usuario_id)
-    if not usuario:
-        raise HTTPException(404, "Usuario no existe")
+def perfil(usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+    usuario = verificar_usuario(usuario_id, password, db)
     minerales = db.query(MineralInventario).filter_by(usuario_id=usuario_id).all()
     piezas = db.query(PiezaInstalada).filter_by(usuario_id=usuario_id).all()
     dispositivos = db.query(Rig).filter_by(usuario_id=usuario_id).all()
@@ -656,11 +677,8 @@ def transferir(req: TransferenciaRequest, db: Session = Depends(get_db)):
 
 # ---------- INVENTARIO detallado (para armar los slots de transferencia) ----------
 @app.get("/inventario/{usuario_id}")
-def inventario(usuario_id: str, db: Session = Depends(get_db)):
-    usuario = db.get(Usuario, usuario_id)
-    if not usuario:
-        raise HTTPException(404, "Usuario no existe")
-
+def inventario(usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+    usuario = verificar_usuario(usuario_id, password, db)
     minerales = db.query(MineralInventario).filter_by(usuario_id=usuario_id).all()
     piezas = db.query(PiezaInstalada).filter_by(usuario_id=usuario_id).all()
 
@@ -673,3 +691,107 @@ def inventario(usuario_id: str, db: Session = Depends(get_db)):
         "minerales": {m.mineral: m.cantidad for m in minerales if m.cantidad > 0},
         "piezas": piezas_agrupadas,
     }
+
+
+# ---------- EQUIPO: equipar una pieza del inventario en un slot de un rig ----------
+@app.post("/rig/equipar_pieza")
+def equipar_pieza(pieza_id: int, rig_id: str, usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+    verificar_usuario(usuario_id, password, db)
+
+    pieza = db.get(PiezaInstalada, pieza_id)
+    if not pieza or pieza.usuario_id != usuario_id:
+        raise HTTPException(404, "Pieza no encontrada")
+    if pieza.rig_id is not None:
+        raise HTTPException(400, "Esa pieza ya está equipada en otro rig — desequipala primero")
+
+    grupo = db.query(RigGrupo).filter_by(id=rig_id, usuario_id=usuario_id).first()
+    if not grupo:
+        raise HTTPException(404, "Rig no encontrado")
+
+    receta = RECETAS[pieza.pieza_id]
+    ya_ocupado = db.query(PiezaInstalada).filter_by(usuario_id=usuario_id, rig_id=rig_id, slot=receta["slot"]).first()
+    if ya_ocupado:
+        raise HTTPException(400, f"El slot '{receta['slot']}' de ese rig ya tiene una pieza — desequipala primero")
+
+    pieza.rig_id = rig_id
+    db.commit()
+    return {"status": "ok", "pieza_id": pieza.id, "slot": receta["slot"], "rig_id": rig_id}
+
+
+# ---------- EQUIPO: desequipar una pieza (vuelve al inventario) ----------
+@app.post("/rig/desequipar_pieza")
+def desequipar_pieza(pieza_id: int, usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+    verificar_usuario(usuario_id, password, db)
+    pieza = db.get(PiezaInstalada, pieza_id)
+    if not pieza or pieza.usuario_id != usuario_id:
+        raise HTTPException(404, "Pieza no encontrada")
+    pieza.rig_id = None
+    db.commit()
+    return {"status": "ok", "pieza_id": pieza.id}
+
+
+# ---------- EQUIPO: reparar durabilidad (cuesta la mitad de los minerales originales) ----------
+@app.post("/rig/reparar_pieza")
+def reparar_pieza(pieza_id: int, usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+    verificar_usuario(usuario_id, password, db)
+    pieza = db.get(PiezaInstalada, pieza_id)
+    if not pieza or pieza.usuario_id != usuario_id:
+        raise HTTPException(404, "Pieza no encontrada")
+
+    receta = RECETAS[pieza.pieza_id]
+    if pieza.durabilidad_actual >= receta["durabilidad_max"]:
+        raise HTTPException(400, "Esa pieza ya está al 100% de durabilidad")
+
+    costo_reparacion = {m: max(1, cantidad // 2) for m, cantidad in receta["requiere"].items()}
+    for mineral, cantidad in costo_reparacion.items():
+        inv = db.query(MineralInventario).filter_by(usuario_id=usuario_id, mineral=mineral).first()
+        if not inv or inv.cantidad < cantidad:
+            raise HTTPException(400, f"Faltan {mineral} para reparar (necesitás {cantidad})")
+
+    for mineral, cantidad in costo_reparacion.items():
+        inv = db.query(MineralInventario).filter_by(usuario_id=usuario_id, mineral=mineral).first()
+        inv.cantidad -= cantidad
+
+    pieza.durabilidad_actual = receta["durabilidad_max"]
+    db.commit()
+    return {"status": "ok", "pieza_id": pieza.id, "durabilidad_actual": pieza.durabilidad_actual}
+
+
+# ---------- EQUIPO: ver el estado de los 9 slots de un rig ----------
+# ---------- EQUIPO: piezas sin equipar (para elegir cuál poner en un rig) ----------
+@app.get("/inventario_piezas/{usuario_id}")
+def piezas_sueltas(usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+    verificar_usuario(usuario_id, password, db)
+    piezas = db.query(PiezaInstalada).filter_by(usuario_id=usuario_id, rig_id=None).all()
+    return [
+        {
+            "id": p.id, "pieza_id": p.pieza_id, "slot": p.slot,
+            "durabilidad_actual": p.durabilidad_actual,
+            "durabilidad_max": RECETAS[p.pieza_id]["durabilidad_max"],
+            "buff_hashrate": RECETAS[p.pieza_id]["buff_hashrate"],
+        }
+        for p in piezas
+    ]
+
+
+@app.get("/rig/{rig_id}/equipo")
+def ver_equipo_rig(rig_id: str, usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+    verificar_usuario(usuario_id, password, db)
+    piezas = db.query(PiezaInstalada).filter_by(usuario_id=usuario_id, rig_id=rig_id).all()
+    por_slot = {p.slot: p for p in piezas}
+
+    resultado = []
+    for slot in SLOTS_RIG:
+        p = por_slot.get(slot)
+        if p:
+            receta = RECETAS[p.pieza_id]
+            resultado.append({
+                "slot": slot, "ocupado": True, "pieza_id": p.pieza_id,
+                "durabilidad_actual": p.durabilidad_actual, "durabilidad_max": receta["durabilidad_max"],
+                "buff_hashrate": receta["buff_hashrate"],
+            })
+        else:
+            resultado.append({"slot": slot, "ocupado": False})
+
+    completo = all(r["ocupado"] and r["durabilidad_actual"] > 0 for r in resultado)
+    return {"rig_id": rig_id, "slots": resultado, "rig_completo": completo, "bonus_set": BONUS_RIG_COMPLETO if completo else 0}
