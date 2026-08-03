@@ -11,16 +11,24 @@ class Usuario(Base):
     __tablename__ = "usuarios"
     id = Column(String, primary_key=True)
     nombre = Column(String, unique=True)
+    password = Column(String, nullable=True)
     wallet = Column(String, nullable=True)
-    password_hash = Column(String, nullable=True)
     oro_saldo = Column(Float, default=0)
     oro_historico = Column(Float, default=0)
+
+
+class RigGrupo(Base):
+    __tablename__ = "rig_grupos"
+    id = Column(String, primary_key=True)  # ej: "1", "2" (por usuario)
+    usuario_id = Column(String, ForeignKey("usuarios.id"))
+    nombre = Column(String, nullable=True)
 
 
 class Rig(Base):
     __tablename__ = "rigs"
     mac = Column(String, primary_key=True)
     usuario_id = Column(String, ForeignKey("usuarios.id"))
+    rig_id = Column(String, nullable=True)  # a qué RigGrupo pertenece (null = sin asignar)
     nombre = Column(String, nullable=True)  # nombre personalizado, ej. "Rig Hércules"
     activo = Column(Boolean, default=True)
     dias_electricidad_prepagados = Column(Integer, default=1)  # 1 día gratis al registrar
