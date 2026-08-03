@@ -786,7 +786,7 @@ def ver_equipo_rig(rig_id: str, usuario_id: str, password: str = None, db: Sessi
         if p:
             receta = RECETAS[p.pieza_id]
             resultado.append({
-                "slot": slot, "ocupado": True, "pieza_id": p.pieza_id,
+                "id": p.id, "slot": slot, "ocupado": True, "pieza_id": p.pieza_id,
                 "durabilidad_actual": p.durabilidad_actual, "durabilidad_max": receta["durabilidad_max"],
                 "buff_hashrate": receta["buff_hashrate"],
             })
