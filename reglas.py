@@ -88,6 +88,75 @@ NIVELES = [
     {"nombre": "Leyenda",  "oro_minado_min": 10_000_000_000},
 ]
 
+# ---------- NIVELES POR DISPOSITIVO (experiencia individual de cada ESP32/celular) ----------
+# Cada share exitoso suma XP al dispositivo que lo mandó. Al subir de nivel, ese
+# dispositivo produce más Oro (buff_oro se suma al resto de buffs en /submit).
+XP_POR_SHARE = 1.0
+
+NIVELES_DISPOSITIVO = [
+    {"nombre": "Nivel 1", "xp_min": 0,     "buff_oro": 0.00},
+    {"nombre": "Nivel 2", "xp_min": 200,   "buff_oro": 0.01},
+    {"nombre": "Nivel 3", "xp_min": 600,   "buff_oro": 0.02},
+    {"nombre": "Nivel 4", "xp_min": 1500,  "buff_oro": 0.04},
+    {"nombre": "Nivel 5", "xp_min": 3500,  "buff_oro": 0.06},
+    {"nombre": "Nivel 6", "xp_min": 7500,  "buff_oro": 0.09},
+    {"nombre": "Nivel 7", "xp_min": 15000, "buff_oro": 0.12},
+    {"nombre": "Nivel 8", "xp_min": 30000, "buff_oro": 0.16},
+    {"nombre": "Nivel 9", "xp_min": 60000, "buff_oro": 0.20},
+    {"nombre": "Nivel 10","xp_min": 120000,"buff_oro": 0.25},
+]
+
+
+def calcular_nivel_dispositivo(experiencia):
+    nivel_actual = NIVELES_DISPOSITIVO[0]
+    for nivel in NIVELES_DISPOSITIVO:
+        if experiencia >= nivel["xp_min"]:
+            nivel_actual = nivel
+    return nivel_actual
+
+
+def siguiente_nivel_dispositivo(experiencia):
+    for nivel in NIVELES_DISPOSITIVO:
+        if experiencia < nivel["xp_min"]:
+            return nivel
+    return None  # ya está en el nivel máximo
+
+
+# ---------- VIP PREMIUM (suscripción mensual por rig completo, pago manual en USDT) ----------
+VIP_PRECIO_USDT_MES = 0.60
+VIP_DIAS_POR_PAGO = 30
+VIP_BUFF_ORO = 0.03       # +3% Oro adicional por share, si el rig está completo y con VIP activo
+VIP_BUFF_DROP = 0.02      # +2% probabilidad extra de drop de minerales/piezas raras
+
+# ---------- CERTIFICADOS (activos de prestigio, se ganan al alcanzar ciertos niveles de dispositivo) ----------
+# Cada certificado se otorga UNA vez por dispositivo (no se repite al volver a pasar por ese nivel).
+# Se pueden equipar a un rig para sumar su buff_oro, vender en el mercado oficial (con comisión) o
+# tradear directo entre usuarios acordando el pago en Oro.
+CERTIFICADOS = {
+    "certificado_bronce": {"nombre": "Certificado de Bronce", "nivel_dispositivo_requerido": "Nivel 4",  "buff_oro": 0.01},
+    "certificado_plata":  {"nombre": "Certificado de Plata",  "nivel_dispositivo_requerido": "Nivel 7",  "buff_oro": 0.02},
+    "certificado_oro":    {"nombre": "Certificado de Oro",    "nivel_dispositivo_requerido": "Nivel 10", "buff_oro": 0.04},
+}
+
+# Al vender un certificado en el mercado oficial, esta comisión se descuenta en Oro del monto
+# que recibe el vendedor (queda "quemada", no va a nadie — mantiene la economía interna equilibrada).
+COMISION_MERCADO_CERTIFICADOS = 0.05  # 5%
+
+# ---------- LOGROS (medallas visibles, se otorgan solas al cumplir la condición) ----------
+LOGROS = {
+    "minero_novato": {"nombre": "Minero Novato",   "descripcion": "Llegar a 1.000 Oro histórico",        "campo": "oro_historico", "valor": 1_000},
+    "minero_elite":  {"nombre": "Minero Élite",    "descripcion": "Llegar a 1.000.000 Oro histórico",    "campo": "oro_historico", "valor": 1_000_000},
+    "coleccionista": {"nombre": "Coleccionista",   "descripcion": "Conseguir 3 certificados",             "campo": "certificados",  "valor": 3},
+    "suscriptor_vip":{"nombre": "Suscriptor Fiel", "descripcion": "Activar VIP en algún rig",             "campo": "vip",           "valor": 1},
+}
+
+# ---------- MISIONES DIARIAS (se resetean solas cada día, según shares minados hoy) ----------
+MISIONES_DIARIAS = [
+    {"id": "mision_5",  "nombre": "Minar 5 shares hoy",  "shares_requeridos": 5,  "recompensa_oro": 200},
+    {"id": "mision_20", "nombre": "Minar 20 shares hoy", "shares_requeridos": 20, "recompensa_oro": 1000},
+]
+
+
 # Dificultad FIJA por dispositivo — no cambia con la cantidad de usuarios.
 # Calibrada para que un ESP32 individual encuentre un share cada ~25s.
 DIFICULTAD_DISPOSITIVO = 4  # ajustar tras medir hashrate real del ESP32
@@ -100,6 +169,12 @@ META_ORO_SEMANAL = 50_000_000 * 24 * 7  # meta total de emisión de la red por s
 
 COSTO_DIARIO_USDT = 0.01
 ROTACION_JOB_SEGUNDOS = 25  # alineado a que un share tarde ~25s en promedio
+
+# ---------- ELECTRICIDAD GRATIS POR ENCUESTA (CPX Research) ----------
+# Al completar una encuesta/oferta en CPX, el usuario recibe electricidad gratis
+# para un rig completo de 6 ESP32 (los que tenga con menos días cargados primero).
+ENCUESTA_DIAS_ELECTRICIDAD = 10      # días de electricidad que otorga cada encuesta completada
+ENCUESTA_MAX_ESP32 = 6               # "un rig completo de 6 unidades"
 
 # Paquetes de electricidad prepagada (precio POR CADA ESP32 que tenga el usuario)
 PAQUETES_ELECTRICIDAD = {
