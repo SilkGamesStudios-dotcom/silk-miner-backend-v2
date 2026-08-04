@@ -13,12 +13,12 @@ class Usuario(Base):
     nombre = Column(String, unique=True)
     password = Column(String, nullable=True)
     wallet = Column(String, nullable=True)
+    whatsapp = Column(String, nullable=True)
     oro_saldo = Column(Float, default=0)
     oro_historico = Column(Float, default=0)
     shares_hoy = Column(Integer, default=0)             # se resetea solo cuando cambia fecha_actividad
     fecha_actividad = Column(String, nullable=True)      # "YYYY-MM-DD" del último share minado
     misiones_reclamadas_hoy = Column(String, default="")  # ids de misión ya cobrados hoy, separados por coma
-    whatsapp = Column(String, nullable=True)  # número con código de país, ej: "+18091234567". El usuario lo carga si quiere.
 
 
 class RigGrupo(Base):
@@ -139,6 +139,20 @@ class OrdenVip(Base):
     fecha_revision = Column(DateTime, nullable=True)
 
 
+class OfertaCompletada(Base):
+    """Registro de cada postback de CPX Research procesado (anti-duplicados + soporte de reversión por fraude)."""
+    __tablename__ = "ofertas_completadas"
+    trans_id = Column(String, primary_key=True)   # trans_id que manda CPX, único por oferta completada
+    usuario_id = Column(String, ForeignKey("usuarios.id"))
+    offer_id = Column(String, nullable=True)
+    monto_usdt = Column(Float, default=0)
+    rigs_recargados = Column(String, default="")   # macs de los ESP32 que recibieron los días, separados por coma (para poder revertir)
+    dias_por_rig = Column(Integer, default=0)
+    estado = Column(String, default="acreditada")   # acreditada / revertida
+    fecha = Column(DateTime, default=datetime.utcnow)
+    fecha_reversion = Column(DateTime, nullable=True)
+
+
 class OrdenMercado(Base):
     __tablename__ = "ordenes_mercado"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -162,6 +176,7 @@ def _migrar_columnas_nuevas():
             ("shares_hoy", "INTEGER DEFAULT 0"),
             ("fecha_actividad", "VARCHAR"),
             ("misiones_reclamadas_hoy", "VARCHAR DEFAULT ''"),
+            ("whatsapp", "VARCHAR"),
         ],
     }
     with engine.connect() as conn:
