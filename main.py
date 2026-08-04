@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from models import SessionLocal, init_db, Usuario, Rig, RigGrupo, MineralInventario, PiezaInstalada, OrdenMercado, OrdenElectricidad, OrdenVip, CertificadoInstalado, LogroObtenido, AnuncioGlobal, EventoActivo, MensajePrivado, MensajeGlobal
+from models import SessionLocal, init_db, Usuario, Rig, RigGrupo, MineralInventario, PiezaInstalada, OrdenMercado, OrdenElectricidad, OrdenVip, CertificadoInstalado, LogroObtenido, AnuncioGlobal, EventoActivo, MensajePrivado, MensajeGlobal, OfertaCompletada
 from reglas import (
     MINERALES, RECETAS, SLOTS_RIG, BONUS_RIG_COMPLETO, DIFICULTAD_DISPOSITIVO, RECOMPENSA_POR_SHARE,
     META_ORO_SEMANAL, COSTO_DIARIO_USDT, ROTACION_JOB_SEGUNDOS, PAQUETES_ELECTRICIDAD, calcular_nivel,
@@ -17,9 +17,14 @@ from reglas import (
     VIP_PRECIO_USDT_MES, VIP_DIAS_POR_PAGO, VIP_BUFF_ORO, VIP_BUFF_DROP,
     CERTIFICADOS, COMISION_MERCADO_CERTIFICADOS,
     LOGROS, MISIONES_DIARIAS,
+    ENCUESTA_DIAS_ELECTRICIDAD, ENCUESTA_MAX_ESP32,
 )
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "SilkAdmin41")
+
+# Secure hash del panel de CPX Research (Aplicaciones > tu app > Seguridad). Se usa para
+# verificar que el postback venga realmente de CPX y no sea un tercero falsificando la llamada.
+CPX_SECURE_HASH = os.environ.get("CPX_SECURE_HASH", "CAMBIAR_ESTE_VALOR_EN_RENDER")
 
 def verificar_admin(x_admin_password: str = Header(None)):
     if x_admin_password != ADMIN_PASSWORD:
@@ -433,6 +438,89 @@ async def subir_comprobante(orden_id: str, file: UploadFile = File(...), db: Ses
     return {"status": "comprobante_recibido", "orden_id": orden_id}
 
 
+# ---------- WEBHOOK CPX RESEARCH: postback al completar/revertir una encuesta ----------
+# CPX llama a esta URL vía GET cuando el usuario completa (status=1) o cuando se
+# detecta fraude / el usuario invalida la respuesta (status=2, "chargeback").
+# URL de postback a configurar en el panel de CPX (Aplicaciones > Postback URL):
+#   https://TU-DOMINIO/webhook/cpx?status={status}&trans_id={trans_id}&user_id={user_id}
+#   &amount_local={amount_local}&amount_usd={amount_usd}&offer_id={offer_ID}&hash={secure_hash}
+@app.get("/webhook/cpx")
+def webhook_cpx(
+    status: int,
+    trans_id: str,
+    user_id: str,
+    amount_local: float = 0,
+    amount_usd: float = 0,
+    offer_id: str = None,
+    hash: str = None,
+    db: Session = Depends(get_db),
+):
+    # 1) Verificación de autenticidad: CPX firma con md5(trans_id + secure_hash)
+    # CPX firma con md5(trans_id + "-" + secure_hash) — el guion es obligatorio, sin él el hash no matchea
+    hash_esperado = hashlib.md5(f"{trans_id}-{CPX_SECURE_HASH}".encode()).hexdigest()
+    if hash != hash_esperado:
+        raise HTTPException(403, "Hash inválido")
+
+    usuario = db.get(Usuario, user_id)
+    if not usuario:
+        # CPX espera 200 igual, si no reintenta indefinidamente con un user_id que no existe más
+        return {"status": "usuario_no_encontrado"}
+
+    oferta_previa = db.get(OfertaCompletada, trans_id)
+
+    # 2) Reversión por fraude: CPX avisa que la oferta ya acreditada era inválida
+    if status == 2:
+        if not oferta_previa or oferta_previa.estado == "revertida":
+            return {"status": "nada_que_revertir"}
+        macs = [m for m in oferta_previa.rigs_recargados.split(",") if m]
+        for mac in macs:
+            rig = db.get(Rig, mac)
+            if rig:
+                rig.dias_electricidad_prepagados = max(0, rig.dias_electricidad_prepagados - oferta_previa.dias_por_rig)
+        oferta_previa.estado = "revertida"
+        oferta_previa.fecha_reversion = datetime.utcnow()
+        db.commit()
+        return {"status": "revertida", "rigs_afectados": len(macs)}
+
+    # 3) Acreditación normal
+    if status != 1:
+        return {"status": "ignorado", "motivo": f"status {status} no manejado"}
+
+    if oferta_previa:
+        # Anti-duplicados: CPX puede reintentar el mismo postback, no acreditar 2 veces
+        return {"status": "ya_procesada"}
+
+    rigs = (
+        db.query(Rig)
+        .filter_by(usuario_id=user_id, activo=True)
+        .order_by(Rig.dias_electricidad_prepagados.asc())
+        .limit(ENCUESTA_MAX_ESP32)
+        .all()
+    )
+    if not rigs:
+        # Igual dejamos constancia de la oferta para que si el usuario da de alta un ESP32
+        # después, quede claro que ya cobró esta encuesta (no se acredita nada retroactivo).
+        db.add(OfertaCompletada(
+            trans_id=trans_id, usuario_id=user_id, offer_id=offer_id, monto_usdt=amount_usd,
+            rigs_recargados="", dias_por_rig=ENCUESTA_DIAS_ELECTRICIDAD, estado="acreditada",
+        ))
+        db.commit()
+        return {"status": "sin_rigs_activos"}
+
+    for rig in rigs:
+        rig.dias_electricidad_prepagados += ENCUESTA_DIAS_ELECTRICIDAD
+
+    db.add(OfertaCompletada(
+        trans_id=trans_id, usuario_id=user_id, offer_id=offer_id, monto_usdt=amount_usd,
+        rigs_recargados=",".join(r.mac for r in rigs), dias_por_rig=ENCUESTA_DIAS_ELECTRICIDAD,
+        estado="acreditada",
+    ))
+    registrar_anuncio(db, f"🎁 Un minero completó una encuesta y ganó {ENCUESTA_DIAS_ELECTRICIDAD} días de electricidad gratis")
+    db.commit()
+
+    return {"status": "acreditada", "rigs_recargados": len(rigs), "dias_por_rig": ENCUESTA_DIAS_ELECTRICIDAD}
+
+
 # ---------- ADMIN: listar órdenes pendientes de revisión ----------
 @app.get("/admin/ordenes_pendientes")
 def ordenes_pendientes(db: Session = Depends(get_db), _admin: bool = Depends(verificar_admin)):
@@ -649,6 +737,17 @@ def publicar_orden(usuario_id: str, tipo_item: str, item_id: str, cantidad: int,
         if not inv or inv.cantidad < cantidad:
             raise HTTPException(400, "Inventario insuficiente")
         inv.cantidad -= cantidad  # se reserva restando ya (simplificado)
+    elif tipo_item == "pieza":
+        if cantidad != 1:
+            raise HTTPException(400, "Las piezas se venden de a una (item_id = id de la pieza instalada)")
+        pieza = db.get(PiezaInstalada, int(item_id))
+        if not pieza or pieza.usuario_id != usuario_id:
+            raise HTTPException(404, "Pieza no encontrada")
+        if pieza.rig_id is not None:
+            raise HTTPException(400, "Desequipala del rig antes de venderla")
+        ya_listada = db.query(OrdenMercado).filter_by(tipo_item="pieza", item_id=item_id, estado="abierta").first()
+        if ya_listada:
+            raise HTTPException(400, "Esa pieza ya está publicada en el mercado")
     elif tipo_item == "certificado":
         if cantidad != 1:
             raise HTTPException(400, "Los certificados se venden de a uno")
@@ -693,7 +792,11 @@ def comprar_orden(usuario_id: str, orden_id: int, password: str = None, db: Sess
         inv.cantidad += orden.cantidad
     elif orden.tipo_item == "pieza":
         vendedor.oro_saldo += orden.precio_oro
-        db.add(PiezaInstalada(usuario_id=usuario_id, pieza_id=orden.item_id))
+        pieza = db.get(PiezaInstalada, int(orden.item_id))
+        if not pieza:
+            raise HTTPException(404, "La pieza ya no existe")
+        pieza.usuario_id = usuario_id
+        pieza.rig_id = None
     elif orden.tipo_item == "certificado":
         # Comisión del mercado oficial: se descuenta del monto que recibe el vendedor y se quema.
         comision = round(orden.precio_oro * COMISION_MERCADO_CERTIFICADOS, 4)
@@ -980,119 +1083,27 @@ def listar_conversaciones(usuario_id: str, password: str = None, db: Session = D
     return list(conversaciones.values())
 
 
-# ---------- CHAT GLOBAL EN TIEMPO REAL (WebSocket, todos ven los mismos mensajes) ----------
-LIMITE_CARACTERES_MENSAJE_GLOBAL = 300
-
-
-class GestorConexiones:
-    def __init__(self):
-        self.activos: dict[str, WebSocket] = {}  # usuario_id -> websocket
-
-    async def conectar(self, usuario_id: str, ws: WebSocket):
-        await ws.accept()
-        self.activos[usuario_id] = ws
-
-    def desconectar(self, usuario_id: str):
-        self.activos.pop(usuario_id, None)
-
-    async def difundir(self, payload: dict):
-        muertos = []
-        for uid, ws in self.activos.items():
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                muertos.append(uid)
-        for uid in muertos:
-            self.desconectar(uid)
-
-
-gestor_chat_global = GestorConexiones()
-
-
-@app.get("/chat/global/historial")
-def historial_chat_global(limite: int = 50, db: Session = Depends(get_db)):
-    mensajes = (
-        db.query(MensajeGlobal)
-        .order_by(MensajeGlobal.fecha.desc())
-        .limit(limite)
-        .all()
-    )
-    mensajes.reverse()
-    return [
-        {"id": m.id, "usuario": m.usuario_id, "texto": m.texto, "fecha": m.fecha.isoformat()}
-        for m in mensajes
-    ]
-
-
-@app.websocket("/ws/chat-global")
-async def ws_chat_global(ws: WebSocket, usuario_id: str, password: str):
-    db = SessionLocal()
-    try:
-        try:
-            verificar_usuario(usuario_id, password, db)
-        except HTTPException:
-            await ws.close(code=4401)
-            return
-
-        await gestor_chat_global.conectar(usuario_id, ws)
-        await gestor_chat_global.difundir({
-            "tipo": "sistema", "texto": f"{usuario_id} se conectó al chat",
-            "fecha": datetime.utcnow().isoformat(),
-        })
-
-        try:
-            while True:
-                data = await ws.receive_json()
-                texto = (data.get("texto") or "").strip()
-                if not texto:
-                    continue
-                if len(texto) > LIMITE_CARACTERES_MENSAJE_GLOBAL:
-                    await ws.send_json({"tipo": "error", "detalle": f"Máximo {LIMITE_CARACTERES_MENSAJE_GLOBAL} caracteres"})
-                    continue
-
-                msg = MensajeGlobal(usuario_id=usuario_id, texto=texto)
-                db.add(msg)
-                db.commit()
-
-                await gestor_chat_global.difundir({
-                    "tipo": "mensaje", "id": msg.id, "usuario": usuario_id,
-                    "texto": texto, "fecha": msg.fecha.isoformat(),
-                })
-        except WebSocketDisconnect:
-            gestor_chat_global.desconectar(usuario_id)
-            await gestor_chat_global.difundir({
-                "tipo": "sistema", "texto": f"{usuario_id} se desconectó",
-                "fecha": datetime.utcnow().isoformat(),
-            })
-    finally:
-        db.close()
-
-
-# ---------- WHATSAPP: cada usuario carga su número si quiere, solo se revela a quien ya le escribió ----------
-import re as _re
-PATRON_WHATSAPP = _re.compile(r"^\+\d{8,15}$")
-
-
+# ---------- WHATSAPP: guardar/borrar el propio número (opcional) ----------
 @app.post("/perfil/whatsapp")
-def guardar_whatsapp(usuario_id: str, password: str, numero: str = None, db: Session = Depends(get_db)):
+def guardar_whatsapp(usuario_id: str, numero: str = "", password: str = None, db: Session = Depends(get_db)):
     usuario = verificar_usuario(usuario_id, password, db)
-    if numero is None or numero.strip() == "":
-        usuario.whatsapp = None
-        db.commit()
-        return {"status": "eliminado"}
     numero = numero.strip()
-    if not PATRON_WHATSAPP.match(numero):
-        raise HTTPException(400, "Formato inválido. Usá código de país, ej: +18091234567")
-    usuario.whatsapp = numero
+    if numero:
+        solo_digitos = "".join(c for c in numero if c.isdigit())
+        if len(solo_digitos) < 8 or len(solo_digitos) > 15:
+            raise HTTPException(400, "Número de WhatsApp inválido")
+        usuario.whatsapp = numero
+    else:
+        usuario.whatsapp = None
     db.commit()
-    return {"status": "guardado", "whatsapp": numero}
+    return {"status": "ok", "whatsapp": usuario.whatsapp}
 
 
+# ---------- WHATSAPP: ver el de otro usuario — SOLO si ya se escribieron por el chat privado ----------
 @app.get("/chat/whatsapp/{usuario_id}/{otro_usuario_id}")
-def obtener_whatsapp_contacto(usuario_id: str, otro_usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+def ver_whatsapp_de_contacto(usuario_id: str, otro_usuario_id: str, password: str = None, db: Session = Depends(get_db)):
     verificar_usuario(usuario_id, password, db)
-    # Solo se revela el número si ya existe al menos un mensaje entre ambos (evita cosechar números sin haber hablado)
-    existe_conversacion = (
+    hay_conversacion = (
         db.query(MensajePrivado)
         .filter(
             ((MensajePrivado.de_usuario_id == usuario_id) & (MensajePrivado.para_usuario_id == otro_usuario_id))
@@ -1100,13 +1111,91 @@ def obtener_whatsapp_contacto(usuario_id: str, otro_usuario_id: str, password: s
         )
         .first()
     )
-    if not existe_conversacion:
-        raise HTTPException(403, "Necesitás tener al menos un mensaje intercambiado con este usuario")
-
+    if not hay_conversacion:
+        raise HTTPException(403, "Todavía no tenés una conversación con este usuario")
     otro = db.get(Usuario, otro_usuario_id)
-    if not otro or not otro.whatsapp:
-        return {"whatsapp": None}
+    if not otro:
+        raise HTTPException(404, "Usuario no encontrado")
     return {"whatsapp": otro.whatsapp}
+
+
+# ---------- CHAT GLOBAL: historial por REST (se pide una vez al conectar, antes de abrir el socket) ----------
+@app.get("/chat/global/historial")
+def historial_chat_global(limite: int = 50, db: Session = Depends(get_db)):
+    mensajes = db.query(MensajeGlobal).order_by(MensajeGlobal.fecha.desc()).limit(limite).all()
+    return [{"usuario": m.usuario_id, "texto": m.texto, "fecha": m.fecha.isoformat()} for m in reversed(mensajes)]
+
+
+# ---------- CHAT GLOBAL: WebSocket, todos los usuarios conectados a la misma sala ----------
+LIMITE_CARACTERES_CHAT_GLOBAL = 300
+
+
+class GestorChatGlobal:
+    def __init__(self):
+        self.conexiones: dict[WebSocket, str] = {}  # socket -> usuario_id
+
+    async def conectar(self, ws: WebSocket, usuario_id: str):
+        await ws.accept()
+        self.conexiones[ws] = usuario_id
+
+    def desconectar(self, ws: WebSocket):
+        self.conexiones.pop(ws, None)
+
+    async def difundir(self, payload: dict):
+        muertos = []
+        for ws in list(self.conexiones.keys()):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                muertos.append(ws)
+        for ws in muertos:
+            self.desconectar(ws)
+
+
+gestor_chat_global = GestorChatGlobal()
+
+
+@app.websocket("/ws/chat-global")
+async def ws_chat_global(ws: WebSocket, usuario_id: str = None, password: str = None):
+    db = SessionLocal()
+    try:
+        if not usuario_id or not password:
+            await ws.close(code=4401)
+            return
+        try:
+            verificar_usuario(usuario_id, password, db)
+        except HTTPException:
+            await ws.close(code=4401)
+            return
+
+        await gestor_chat_global.conectar(ws, usuario_id)
+        try:
+            while True:
+                data = await ws.receive_json()
+                texto = str(data.get("texto", "")).strip()
+                if not texto:
+                    continue
+                if len(texto) > LIMITE_CARACTERES_CHAT_GLOBAL:
+                    await ws.send_json({"tipo": "error", "detalle": f"Máximo {LIMITE_CARACTERES_CHAT_GLOBAL} caracteres"})
+                    continue
+
+                msg = MensajeGlobal(usuario_id=usuario_id, texto=texto)
+                db.add(msg)
+                db.commit()
+
+                await gestor_chat_global.difundir({
+                    "tipo": "mensaje", "usuario": usuario_id, "texto": texto, "fecha": msg.fecha.isoformat(),
+                })
+        except WebSocketDisconnect:
+            gestor_chat_global.desconectar(ws)
+    finally:
+        db.close()
+
+
+# ---------- PING: keepalive liviano para que el frontend evite que Render duerma el servicio ----------
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
 
 
 # ---------- PERFIL / INVENTARIO ----------
@@ -1283,6 +1372,9 @@ def equipar_pieza(pieza_id: int, rig_id: str, usuario_id: str, password: str = N
         raise HTTPException(404, "Pieza no encontrada")
     if pieza.rig_id is not None:
         raise HTTPException(400, "Esa pieza ya está equipada en otro rig — desequipala primero")
+    listada = db.query(OrdenMercado).filter_by(tipo_item="pieza", item_id=str(pieza.id), estado="abierta").first()
+    if listada:
+        raise HTTPException(400, "Esa pieza está publicada en el mercado — cancelá la publicación primero")
 
     grupo = db.query(RigGrupo).filter_by(id=rig_id, usuario_id=usuario_id).first()
     if not grupo:
