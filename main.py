@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from models import SessionLocal, init_db, Usuario, Rig, RigGrupo, MineralInventario, PiezaInstalada, OrdenMercado, OrdenElectricidad, OrdenVip, CertificadoInstalado, LogroObtenido, AnuncioGlobal, EventoActivo, MensajePrivado, MensajeGlobal, OfertaCompletada
+from models import SessionLocal, init_db, Usuario, Rig, RigGrupo, MineralInventario, PiezaInstalada, OrdenMercado, OrdenElectricidad, OrdenVip, CertificadoInstalado, LogroObtenido, AnuncioGlobal, EventoActivo, MensajePrivado, MensajeGlobal, OfertaCompletada, PartidaMinijuego
 from reglas import (
     MINERALES, RECETAS, SLOTS_RIG, BONUS_RIG_COMPLETO, DIFICULTAD_DISPOSITIVO, RECOMPENSA_POR_SHARE,
     META_ORO_SEMANAL, COSTO_DIARIO_USDT, ROTACION_JOB_SEGUNDOS, PAQUETES_ELECTRICIDAD, calcular_nivel,
@@ -18,6 +18,8 @@ from reglas import (
     CERTIFICADOS, COMISION_MERCADO_CERTIFICADOS,
     LOGROS, MISIONES_DIARIAS,
     ENCUESTA_DIAS_ELECTRICIDAD, ENCUESTA_MAX_ESP32,
+    JUEGOS_DISPONIBLES, MINIJUEGOS_ORO_POR_NIVEL, MINIJUEGOS_NIVELES_POR_TICKET,
+    MINIJUEGOS_PARTIDAS_DIARIAS_MAX, MINIJUEGOS_SEGUNDOS_MIN_POR_NIVEL, TIENDA_CANJE,
 )
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "SilkAdmin41")
@@ -438,6 +440,134 @@ async def subir_comprobante(orden_id: str, file: UploadFile = File(...), db: Ses
     return {"status": "comprobante_recibido", "orden_id": orden_id}
 
 
+# ---------- SILK ARCADE: mini-juegos que dan Oro + Tickets ----------
+@app.get("/minijuegos/catalogo")
+def catalogo_minijuegos():
+    return {
+        "juegos": [{"id": jid, **info} for jid, info in JUEGOS_DISPONIBLES.items()],
+        "oro_por_nivel": MINIJUEGOS_ORO_POR_NIVEL,
+        "niveles_por_ticket": MINIJUEGOS_NIVELES_POR_TICKET,
+        "partidas_diarias_max": MINIJUEGOS_PARTIDAS_DIARIAS_MAX,
+    }
+
+
+@app.get("/minijuegos/estado")
+def estado_minijuegos(usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+    usuario = verificar_usuario(usuario_id, password, db)
+    hoy = datetime.utcnow().date()
+    partidas_hoy = (
+        db.query(PartidaMinijuego)
+        .filter(PartidaMinijuego.usuario_id == usuario_id, func.date(PartidaMinijuego.fecha) == hoy)
+        .count()
+    )
+    return {
+        "tickets_saldo": usuario.tickets_saldo,
+        "partidas_hoy": partidas_hoy,
+        "partidas_restantes": max(0, MINIJUEGOS_PARTIDAS_DIARIAS_MAX - partidas_hoy),
+    }
+
+
+@app.post("/minijuegos/registrar_partida")
+def registrar_partida_minijuego(
+    usuario_id: str, password: str, juego: str, nivel_alcanzado: int, duracion_segundos: int,
+    db: Session = Depends(get_db),
+):
+    usuario = verificar_usuario(usuario_id, password, db)
+
+    if juego not in JUEGOS_DISPONIBLES:
+        raise HTTPException(400, "Juego no reconocido")
+    if nivel_alcanzado < 1:
+        raise HTTPException(400, "nivel_alcanzado inválido")
+
+    hoy = datetime.utcnow().date()
+    partidas_hoy = (
+        db.query(PartidaMinijuego)
+        .filter(PartidaMinijuego.usuario_id == usuario_id, func.date(PartidaMinijuego.fecha) == hoy)
+        .count()
+    )
+    if partidas_hoy >= MINIJUEGOS_PARTIDAS_DIARIAS_MAX:
+        return {"status": "limite_diario_alcanzado", "oro_ganado": 0, "tickets_ganados": 0}
+
+    # Anti-bot simple: si reportan un nivel alto en muy poco tiempo, se rechaza la partida entera
+    minimo_esperado = nivel_alcanzado * MINIJUEGOS_SEGUNDOS_MIN_POR_NIVEL
+    if duracion_segundos < minimo_esperado:
+        raise HTTPException(400, "Duración reportada demasiado corta para ese nivel")
+
+    oro_ganado = nivel_alcanzado * MINIJUEGOS_ORO_POR_NIVEL
+    tickets_ganados = nivel_alcanzado // MINIJUEGOS_NIVELES_POR_TICKET
+
+    usuario.oro_saldo += oro_ganado
+    usuario.oro_historico += oro_ganado
+    usuario.tickets_saldo += tickets_ganados
+
+    db.add(PartidaMinijuego(
+        usuario_id=usuario_id, juego=juego, nivel_alcanzado=nivel_alcanzado,
+        duracion_segundos=duracion_segundos, oro_ganado=oro_ganado, tickets_ganados=tickets_ganados,
+    ))
+    db.commit()
+
+    return {
+        "status": "ok", "oro_ganado": oro_ganado, "tickets_ganados": tickets_ganados,
+        "tickets_saldo": usuario.tickets_saldo, "oro_saldo": usuario.oro_saldo,
+        "partidas_restantes": max(0, MINIJUEGOS_PARTIDAS_DIARIAS_MAX - (partidas_hoy + 1)),
+    }
+
+
+# ---------- TIENDA DE CANJE (Gift Shop — se paga con Tickets) ----------
+@app.get("/tienda/catalogo")
+def catalogo_tienda():
+    return {"items": [{"id": iid, **info} for iid, info in TIENDA_CANJE.items()]}
+
+
+@app.post("/tienda/canjear")
+def canjear_tienda(usuario_id: str, password: str, item_id: str, db: Session = Depends(get_db)):
+    usuario = verificar_usuario(usuario_id, password, db)
+    item = TIENDA_CANJE.get(item_id)
+    if not item:
+        raise HTTPException(404, "Item de la tienda no encontrado")
+    if usuario.tickets_saldo < item["costo_tickets"]:
+        raise HTTPException(400, "Tickets insuficientes")
+
+    usuario.tickets_saldo -= item["costo_tickets"]
+    resultado = {"status": "canjeado", "item": item["nombre"], "tickets_saldo": usuario.tickets_saldo}
+
+    if item["tipo"] == "electricidad":
+        rig = (
+            db.query(Rig)
+            .filter_by(usuario_id=usuario_id, activo=True)
+            .order_by(Rig.dias_electricidad_prepagados.asc())
+            .first()
+        )
+        if not rig:
+            raise HTTPException(400, "No tenés dispositivos activos para acreditar electricidad")
+        rig.dias_electricidad_prepagados += item["dias"]
+        resultado["dispositivo"] = rig.mac
+        resultado["dias_acreditados"] = item["dias"]
+
+    elif item["tipo"] == "pieza_random":
+        opciones = [pid for pid, r in RECETAS.items() if pid.endswith(f"_{item['tier']}")]
+        if not opciones:
+            raise HTTPException(500, "No hay piezas de ese tier configuradas")
+        pieza_id = random.choice(opciones)
+        receta = RECETAS[pieza_id]
+        pieza = PiezaInstalada(
+            usuario_id=usuario_id, pieza_id=pieza_id, slot=receta["slot"],
+            rig_id=None, durabilidad_actual=receta["durabilidad_max"],
+        )
+        db.add(pieza)
+        resultado["pieza_id"] = pieza_id
+
+    elif item["tipo"] == "certificado":
+        cert = CertificadoInstalado(
+            usuario_id=usuario_id, certificado_id=item["certificado_id"], origen_mac=None, rig_id=None,
+        )
+        db.add(cert)
+        resultado["certificado_id"] = item["certificado_id"]
+
+    db.commit()
+    return resultado
+
+
 # ---------- WEBHOOK CPX RESEARCH: postback al completar/revertir una encuesta ----------
 # CPX llama a esta URL vía GET cuando el usuario completa (status=1) o cuando se
 # detecta fraude / el usuario invalida la respuesta (status=2, "chargeback").
@@ -737,6 +867,11 @@ def publicar_orden(usuario_id: str, tipo_item: str, item_id: str, cantidad: int,
         if not inv or inv.cantidad < cantidad:
             raise HTTPException(400, "Inventario insuficiente")
         inv.cantidad -= cantidad  # se reserva restando ya (simplificado)
+    elif tipo_item == "ticket":
+        usuario = db.get(Usuario, usuario_id)
+        if not usuario or usuario.tickets_saldo < cantidad:
+            raise HTTPException(400, "Tickets insuficientes")
+        usuario.tickets_saldo -= cantidad  # se reserva restando ya, igual que un mineral
     elif tipo_item == "pieza":
         if cantidad != 1:
             raise HTTPException(400, "Las piezas se venden de a una (item_id = id de la pieza instalada)")
@@ -790,6 +925,9 @@ def comprar_orden(usuario_id: str, orden_id: int, password: str = None, db: Sess
             inv = MineralInventario(usuario_id=usuario_id, mineral=orden.item_id, cantidad=0)
             db.add(inv)
         inv.cantidad += orden.cantidad
+    elif orden.tipo_item == "ticket":
+        vendedor.oro_saldo += orden.precio_oro
+        comprador.tickets_saldo += orden.cantidad
     elif orden.tipo_item == "pieza":
         vendedor.oro_saldo += orden.precio_oro
         pieza = db.get(PiezaInstalada, int(orden.item_id))
@@ -823,6 +961,9 @@ def cancelar_orden(usuario_id: str, orden_id: int, db: Session = Depends(get_db)
     if orden.tipo_item == "mineral":
         inv = db.query(MineralInventario).filter_by(usuario_id=usuario_id, mineral=orden.item_id).first()
         inv.cantidad += orden.cantidad
+    elif orden.tipo_item == "ticket":
+        usuario = db.get(Usuario, usuario_id)
+        usuario.tickets_saldo += orden.cantidad
     # "pieza" y "certificado" no se descuentan al publicar, así que no hay nada que devolver acá.
 
     orden.estado = "cancelada"
@@ -1239,6 +1380,7 @@ def perfil(usuario_id: str, password: str = None, db: Session = Depends(get_db))
     return {
         "usuario": usuario.nombre,
         "oro_saldo": usuario.oro_saldo,
+        "tickets_saldo": usuario.tickets_saldo,
         "nivel": calcular_nivel(usuario.oro_historico)["nombre"],
         "minerales": {m.mineral: m.cantidad for m in minerales},
         "piezas": [p.pieza_id for p in piezas],
