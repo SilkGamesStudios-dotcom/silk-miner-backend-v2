@@ -171,10 +171,14 @@ COSTO_DIARIO_USDT = 0.01
 ROTACION_JOB_SEGUNDOS = 25  # alineado a que un share tarde ~25s en promedio
 
 # ---------- ELECTRICIDAD GRATIS POR ENCUESTA (CPX Research) ----------
-# Al completar una encuesta/oferta en CPX, el usuario recibe electricidad gratis
-# para un rig completo de 6 ESP32 (los que tenga con menos días cargados primero).
-ENCUESTA_DIAS_ELECTRICIDAD = 10      # días de electricidad que otorga cada encuesta completada
-ENCUESTA_MAX_ESP32 = 6               # "un rig completo de 6 unidades"
+# Al completar una encuesta/oferta en CPX, el usuario recibe 1 día de electricidad
+# gratis para UN SOLO dispositivo (ESP32, celular o PC — todos minan igual, ver Rig
+# en models.py). A propósito es poco: así el usuario vuelve a completar encuestas
+# seguido para mantener sus dispositivos con luz, en vez de cubrirse por semanas
+# de una sola vez. Comisión típica por encuesta (~$0.30-0.50) vs costo real de
+# electricidad ($0.01/día/dispositivo) — la repetición es lo que genera ingresos reales.
+ENCUESTA_DIAS_ELECTRICIDAD = 1       # días de electricidad que otorga cada encuesta completada
+ENCUESTA_MAX_ESP32 = 1               # a cuántos dispositivos se les acredita por encuesta (el/los que menos días tengan)
 
 # Paquetes de electricidad prepagada (precio POR CADA ESP32 que tenga el usuario)
 PAQUETES_ELECTRICIDAD = {
@@ -190,3 +194,68 @@ def calcular_nivel(oro_historico):
         if oro_historico >= nivel["oro_minado_min"]:
             nivel_actual = nivel
     return nivel_actual
+
+
+# ---------- MINI-JUEGOS (Silk Arcade) ----------
+# Juegos habilitados hoy. Todos comparten el mismo endpoint de registro de partida
+# y la misma economía — para sumar uno nuevo solo hace falta agregarlo acá y
+# programar su canvas en el frontend, el backend no distingue mecánica interna.
+JUEGOS_DISPONIBLES = {
+    "tetris":     {"nombre": "Tetris",              "emoji": "🧱", "descripcion": "El clásico de siempre — armá líneas completas antes de que se acumulen las piezas. La velocidad de caída sube con cada nivel."},
+    "asteroides": {"nombre": "Asteroides",           "emoji": "🚀", "descripcion": "Esquivá y destruí asteroides con tu nave. Cada nivel suma más rocas y más velocidad."},
+    "cazaminerales": {"nombre": "Cazador de Minerales", "emoji": "⛏️", "descripcion": "Recorré el tablero juntando cobre, hierro y plata mientras esquivás a los virus que te persiguen — el ritmo de Silk Miner, en modo arcade."},
+    "invasion":   {"nombre": "Invasión de las Cuevas", "emoji": "👾", "descripcion": "Las mismas criaturas de tus cuevas bajan en oleadas — defendé tu base. Más oleadas y más rápido en cada nivel."},
+}
+
+# Oro que se entrega por nivel alcanzado en cualquier mini-juego (nivel_alcanzado * este valor)
+MINIJUEGOS_ORO_POR_NIVEL = 500
+
+# Cada cuántos niveles alcanzados se entrega 1 ticket (moneda de logro, para la tienda de canje / mercado)
+MINIJUEGOS_NIVELES_POR_TICKET = 4
+
+# Límite de partidas que cuentan para recompensa por día y por usuario (anti-farmeo)
+MINIJUEGOS_PARTIDAS_DIARIAS_MAX = 5
+
+# Anti-bot simple: si el cliente reporta un nivel alto en muy poco tiempo, es sospechoso.
+# El backend exige que duracion_segundos >= nivel_alcanzado * este valor, o rechaza la partida.
+MINIJUEGOS_SEGUNDOS_MIN_POR_NIVEL = 8
+
+# ---------- TIENDA DE CANJE (Gift Shop — se paga solo con Tickets) ----------
+TIENDA_CANJE = {
+    "canje_electricidad_1": {
+        "nombre": "1 día de electricidad (1 dispositivo)",
+        "costo_tickets": 6,
+        "tipo": "electricidad",
+        "dias": 1,
+    },
+    "canje_electricidad_3": {
+        "nombre": "3 días de electricidad (1 dispositivo)",
+        "costo_tickets": 15,
+        "tipo": "electricidad",
+        "dias": 3,
+    },
+    "canje_pieza_avanzada_random": {
+        "nombre": "Pieza Avanzada al azar (sin craftear)",
+        "costo_tickets": 30,
+        "tipo": "pieza_random",
+        "tier": "avanzada",
+    },
+    "canje_pieza_epica_random": {
+        "nombre": "Pieza Épica al azar (sin craftear)",
+        "costo_tickets": 70,
+        "tipo": "pieza_random",
+        "tier": "epica",
+    },
+    "canje_certificado_bronce": {
+        "nombre": "Certificado de Bronce",
+        "costo_tickets": 20,
+        "tipo": "certificado",
+        "certificado_id": "certificado_bronce",
+    },
+    "canje_certificado_plata": {
+        "nombre": "Certificado de Plata",
+        "costo_tickets": 45,
+        "tipo": "certificado",
+        "certificado_id": "certificado_plata",
+    },
+}
