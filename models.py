@@ -16,6 +16,7 @@ class Usuario(Base):
     whatsapp = Column(String, nullable=True)
     oro_saldo = Column(Float, default=0)
     oro_historico = Column(Float, default=0)
+    tickets_saldo = Column(Float, default=0)  # moneda de logro de los mini-juegos, canjeable en la tienda o tradeable en el mercado
     shares_hoy = Column(Integer, default=0)             # se resetea solo cuando cambia fecha_actividad
     fecha_actividad = Column(String, nullable=True)      # "YYYY-MM-DD" del último share minado
     misiones_reclamadas_hoy = Column(String, default="")  # ids de misión ya cobrados hoy, separados por coma
@@ -139,6 +140,20 @@ class OrdenVip(Base):
     fecha_revision = Column(DateTime, nullable=True)
 
 
+class PartidaMinijuego(Base):
+    """Registro de cada partida terminada de un mini-juego (Tetris, etc.) — sirve
+    para el límite diario anti-farmeo y para auditar oro/tickets entregados."""
+    __tablename__ = "partidas_minijuego"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    usuario_id = Column(String, ForeignKey("usuarios.id"))
+    juego = Column(String)                       # "tetris", "asteroides", etc.
+    nivel_alcanzado = Column(Integer, default=0)
+    duracion_segundos = Column(Integer, default=0)
+    oro_ganado = Column(Float, default=0)
+    tickets_ganados = Column(Integer, default=0)
+    fecha = Column(DateTime, default=datetime.utcnow)
+
+
 class OfertaCompletada(Base):
     """Registro de cada postback de CPX Research procesado (anti-duplicados + soporte de reversión por fraude)."""
     __tablename__ = "ofertas_completadas"
@@ -177,6 +192,7 @@ def _migrar_columnas_nuevas():
             ("fecha_actividad", "VARCHAR"),
             ("misiones_reclamadas_hoy", "VARCHAR DEFAULT ''"),
             ("whatsapp", "VARCHAR"),
+            ("tickets_saldo", "FLOAT DEFAULT 0"),
         ],
     }
     with engine.connect() as conn:
