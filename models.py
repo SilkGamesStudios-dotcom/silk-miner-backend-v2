@@ -1,8 +1,22 @@
+import os
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 
-engine = create_engine("sqlite:///./miner.db", connect_args={"check_same_thread": False})
+# En Render, si agregás una base Postgres (o cualquier DB externa), va a exponer
+# la variable de entorno DATABASE_URL. La usamos si existe, porque el disco local
+# de Render es EFEMERO: se borra en cada redeploy o reinicio del servicio, y con
+# el SQLite local eso significaba perder TODOS los usuarios y su progreso.
+# Si no hay DATABASE_URL configurada (ej. corriendo en tu máquina), cae a SQLite local.
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./miner.db")
+
+# Render entrega la URL de Postgres con el prefijo "postgres://", pero SQLAlchemy
+# moderno requiere "postgresql://". Lo normalizamos acá.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
