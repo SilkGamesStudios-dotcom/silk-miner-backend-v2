@@ -9,17 +9,19 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from models import SessionLocal, init_db, Usuario, Rig, RigGrupo, MineralInventario, PiezaInstalada, OrdenMercado, OrdenElectricidad, OrdenVip, CertificadoInstalado, LogroObtenido, AnuncioGlobal, EventoActivo, MensajePrivado, MensajeGlobal, OfertaCompletada, PartidaMinijuego
+from models import SessionLocal, init_db, Usuario, Rig, RigGrupo, MineralInventario, PiezaInstalada, OrdenMercado, OrdenElectricidad, OrdenVip, OrdenRig, CertificadoInstalado, LogroObtenido, AnuncioGlobal, EventoActivo, MensajePrivado, MensajeGlobal, OfertaCompletada, PartidaMinijuego
 from reglas import (
     MINERALES, RECETAS, SLOTS_RIG, BONUS_RIG_COMPLETO, DIFICULTAD_DISPOSITIVO, RECOMPENSA_POR_SHARE,
     META_ORO_SEMANAL, COSTO_DIARIO_USDT, ROTACION_JOB_SEGUNDOS, PAQUETES_ELECTRICIDAD, calcular_nivel,
     XP_POR_SHARE, calcular_nivel_dispositivo, siguiente_nivel_dispositivo,
     VIP_PRECIO_USDT_MES, VIP_DIAS_POR_PAGO, VIP_BUFF_ORO, VIP_BUFF_DROP,
     CERTIFICADOS, COMISION_MERCADO_CERTIFICADOS,
-    LOGROS, MISIONES_DIARIAS,
+    LOGROS, MISIONES_DIARIAS, RECOMPENSAS_RACHA,
     ENCUESTA_DIAS_ELECTRICIDAD, ENCUESTA_MAX_ESP32,
     JUEGOS_DISPONIBLES, MINIJUEGOS_ORO_POR_NIVEL, MINIJUEGOS_NIVELES_POR_TICKET,
-    MINIJUEGOS_PARTIDAS_DIARIAS_MAX, MINIJUEGOS_SEGUNDOS_MIN_POR_NIVEL, TIENDA_CANJE,
+    COOLDOWN_MINIJUEGO_ESCALADA_SEGUNDOS, MINIJUEGOS_SEGUNDOS_MIN_POR_NIVEL, TIENDA_CANJE,
+    ELECTRICIDAD_TICKETS_DIAS_MAX_SEMANA, PRECIOS_RIG, precio_rig,
+    CUPON_SUBSIDIO_PORCENTAJE, CUPON_SUBSIDIO_DIAS_VALIDEZ, CUPON_SUBSIDIO_MOTIVO,
 )
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "SilkAdmin41")
@@ -52,6 +54,28 @@ def verificar_usuario(usuario_id: str, password: str, db: Session) -> Usuario:
 
 def registrar_anuncio(db: Session, texto: str):
     db.add(AnuncioGlobal(texto=texto))
+
+
+def generar_cupon_si_corresponde(usuario: Usuario, uso_cupon_en_esta_orden: bool):
+    """Se llama al aprobar una orden 100% USDT. Si esa orden NO usó cupón, le genera uno
+    nuevo para la próxima compra (electricidad o rig). Si sí usó uno, no genera otro en
+    cadena — evita que el subsidio se vuelva permanente."""
+    if uso_cupon_en_esta_orden:
+        return
+    usuario.cupon_activo = True
+    usuario.cupon_usado = False
+    usuario.cupon_porcentaje = CUPON_SUBSIDIO_PORCENTAJE
+    usuario.cupon_motivo = CUPON_SUBSIDIO_MOTIVO
+    usuario.cupon_generado_en = datetime.utcnow()
+    usuario.cupon_expira_en = datetime.utcnow() + timedelta(days=CUPON_SUBSIDIO_DIAS_VALIDEZ)
+
+
+def cupon_vigente(usuario: Usuario) -> bool:
+    if not (usuario.cupon_activo and not usuario.cupon_usado):
+        return False
+    if usuario.cupon_expira_en and usuario.cupon_expira_en < datetime.utcnow():
+        return False
+    return True
 
 
 def otorgar_logro_si_corresponde(db: Session, usuario: Usuario, logro_id: str):
@@ -206,15 +230,75 @@ def renombrar_rig(mac: str, usuario_id: str, nuevo_nombre: str, password: str = 
 
 
 # ---------- AGRUPACIÓN: crear un rig (contenedor de hasta 6 ESP32) ----------
+@app.get("/rig/precio_siguiente")
+def precio_siguiente_rig(usuario_id: str, db: Session = Depends(get_db)):
+    """Cuánto cuesta el próximo rig del usuario. El 1ro siempre es gratis."""
+    cantidad_actual = db.query(RigGrupo).filter_by(usuario_id=usuario_id).count()
+    numero_siguiente = cantidad_actual + 1
+    if numero_siguiente == 1:
+        return {"gratis": True, "numero_rig": 1}
+    precio = precio_rig(numero_siguiente)
+    return {"gratis": False, "numero_rig": numero_siguiente, **precio}
+
+
 @app.post("/rig/crear")
-def crear_rig_grupo(usuario_id: str, password: str = None, db: Session = Depends(get_db)):
-    verificar_usuario(usuario_id, password, db)
+def crear_rig_grupo(usuario_id: str, password: str = None, metodo_pago: str = None, mac_pendiente: str = None,
+                     db: Session = Depends(get_db)):
+    """El 1er rig es gratis. Del 2do en adelante hay que indicar metodo_pago:
+    - "oro_tickets": se cobra y se crea el rig en el momento.
+    - "usdt": se crea una orden pendiente (ver /rig/subir_comprobante) — el rig se crea recién al aprobarse.
+    Nota: el método "encuesta" no pasa por acá — se resuelve en /webhook/cpx cuando CPX confirma la oferta."""
+    usuario = verificar_usuario(usuario_id, password, db)
     existentes = db.query(RigGrupo).filter_by(usuario_id=usuario_id).all()
-    siguiente_id = str(max([int(r.id) for r in existentes], default=0) + 1)
-    grupo = RigGrupo(id=siguiente_id, usuario_id=usuario_id, nombre=f"Rig {siguiente_id}")
-    db.add(grupo)
-    db.commit()
-    return {"rig_id": grupo.id, "nombre": grupo.nombre}
+    numero_siguiente = len(existentes) + 1
+
+    if numero_siguiente == 1:
+        siguiente_id = str(max([int(r.id) for r in existentes], default=0) + 1)
+        grupo = RigGrupo(id=siguiente_id, usuario_id=usuario_id, nombre=f"Rig {siguiente_id}")
+        db.add(grupo)
+        db.commit()
+        return {"rig_id": grupo.id, "nombre": grupo.nombre, "gratis": True}
+
+    precio = precio_rig(numero_siguiente)
+
+    if metodo_pago == "oro_tickets":
+        if usuario.oro_saldo < precio["oro"] or usuario.tickets_saldo < precio["tickets"]:
+            raise HTTPException(400, "Oro o tickets insuficientes para abrir este rig")
+        usuario.oro_saldo -= precio["oro"]
+        usuario.tickets_saldo -= precio["tickets"]
+
+        siguiente_id = str(max([int(r.id) for r in existentes], default=0) + 1)
+        grupo = RigGrupo(id=siguiente_id, usuario_id=usuario_id, nombre=f"Rig {siguiente_id}")
+        db.add(grupo)
+        db.commit()
+        return {"rig_id": grupo.id, "nombre": grupo.nombre, "gratis": False,
+                "pagado_con": "oro_tickets", "oro_descontado": precio["oro"], "tickets_descontados": precio["tickets"]}
+
+    if metodo_pago == "usdt":
+        subtotal = precio["precio_usdt"]
+        descuento = 0
+        cupon_aplicado = False
+        if cupon_vigente(usuario):
+            descuento = subtotal * (usuario.cupon_porcentaje / 100)
+            cupon_aplicado = True
+        monto_final = round(subtotal - descuento, 2)
+
+        orden_id = f"rig_{usuario_id}_{uuid.uuid4().hex[:10]}"
+        orden = OrdenRig(
+            id=orden_id, usuario_id=usuario_id, numero_rig=numero_siguiente,
+            mac_pendiente=mac_pendiente, monto_usdt=monto_final, cupon_aplicado=cupon_aplicado,
+            estado="pendiente_revision",
+        )
+        db.add(orden)
+        db.commit()
+        return {
+            "gratis": False, "pagado_con": "usdt", "orden_id": orden_id,
+            "binance_pay_id": BINANCE_PAY_ID, "monto_a_pagar_usdt": monto_final,
+            "numero_rig": numero_siguiente,
+            "siguiente_paso": "Sube el comprobante con /rig/subir_comprobante",
+        }
+
+    raise HTTPException(400, "Falta indicar metodo_pago: 'usdt' u 'oro_tickets' (para 'encuesta', usá el flujo de CPX)")
 
 
 # ---------- AGRUPACIÓN: asignar un ESP32 a un rig (máx 6 por rig) ----------
@@ -236,6 +320,94 @@ def asignar_esp32(mac: str, rig_id: str, usuario_id: str, password: str = None, 
     dispositivo.rig_id = rig_id
     db.commit()
     return {"status": "ok", "mac": mac, "rig_id": rig_id}
+
+
+# ---------- RIG NUEVO PAGADO CON USDT: subir comprobante ----------
+@app.post("/rig/subir_comprobante")
+async def subir_comprobante_rig(orden_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    orden = db.get(OrdenRig, orden_id)
+    if not orden:
+        raise HTTPException(404, "Orden no encontrada")
+    if orden.estado != "pendiente_revision":
+        raise HTTPException(400, "Esta orden ya fue procesada")
+
+    os.makedirs("comprobantes", exist_ok=True)
+    ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
+    ruta = f"comprobantes/{orden_id}.{ext}"
+    with open(ruta, "wb") as f:
+        f.write(await file.read())
+
+    orden.comprobante_path = ruta
+    db.commit()
+    return {"status": "comprobante_recibido", "orden_id": orden_id}
+
+
+# ---------- ADMIN: órdenes de rig pendientes ----------
+@app.get("/admin/ordenes_rig_pendientes")
+def ordenes_rig_pendientes(db: Session = Depends(get_db), _admin: bool = Depends(verificar_admin)):
+    ordenes = db.query(OrdenRig).filter_by(estado="pendiente_revision").order_by(OrdenRig.fecha).all()
+    return [
+        {
+            "orden_id": o.id, "usuario_id": o.usuario_id, "numero_rig": o.numero_rig,
+            "mac_pendiente": o.mac_pendiente, "monto_usdt": o.monto_usdt,
+            "cupon_aplicado": o.cupon_aplicado, "tiene_comprobante": bool(o.comprobante_path),
+            "comprobante_path": o.comprobante_path, "fecha": o.fecha.isoformat(),
+        }
+        for o in ordenes
+    ]
+
+
+@app.get("/admin/comprobante_rig/{orden_id}")
+def ver_comprobante_rig(orden_id: str, x_admin_password: str = None, db: Session = Depends(get_db)):
+    if x_admin_password != ADMIN_PASSWORD:
+        raise HTTPException(401, "No autorizado")
+    orden = db.get(OrdenRig, orden_id)
+    if not orden or not orden.comprobante_path or not os.path.exists(orden.comprobante_path):
+        raise HTTPException(404, "Comprobante no encontrado")
+    return FileResponse(orden.comprobante_path)
+
+
+@app.post("/admin/aprobar_orden_rig")
+def aprobar_orden_rig(orden_id: str, db: Session = Depends(get_db), _admin: bool = Depends(verificar_admin)):
+    orden = db.get(OrdenRig, orden_id)
+    if not orden:
+        raise HTTPException(404, "Orden no encontrada")
+    if orden.estado != "pendiente_revision":
+        raise HTTPException(400, "Orden ya procesada")
+
+    usuario = db.get(Usuario, orden.usuario_id)
+    existentes = db.query(RigGrupo).filter_by(usuario_id=orden.usuario_id).all()
+    siguiente_id = str(max([int(r.id) for r in existentes], default=0) + 1)
+    grupo = RigGrupo(id=siguiente_id, usuario_id=orden.usuario_id, nombre=f"Rig {siguiente_id}")
+    db.add(grupo)
+
+    if orden.cupon_aplicado:
+        usuario.cupon_usado = True
+    generar_cupon_si_corresponde(usuario, orden.cupon_aplicado)
+
+    if orden.mac_pendiente:
+        dispositivo = db.get(Rig, orden.mac_pendiente)
+        if dispositivo and dispositivo.usuario_id == orden.usuario_id:
+            dispositivo.rig_id = grupo.id
+
+    orden.estado = "aprobada"
+    orden.fecha_revision = datetime.utcnow()
+    db.commit()
+    return {"status": "aprobada", "rig_id": grupo.id, "mac_asignado": orden.mac_pendiente}
+
+
+@app.post("/admin/rechazar_orden_rig")
+def rechazar_orden_rig(orden_id: str, db: Session = Depends(get_db), _admin: bool = Depends(verificar_admin)):
+    orden = db.get(OrdenRig, orden_id)
+    if not orden:
+        raise HTTPException(404, "Orden no encontrada")
+    if orden.estado != "pendiente_revision":
+        raise HTTPException(400, "Orden ya procesada")
+
+    orden.estado = "rechazada"
+    orden.fecha_revision = datetime.utcnow()
+    db.commit()
+    return {"status": "rechazada"}
 
 
 # ---------- JOB ----------
@@ -387,8 +559,9 @@ def descontar_dia_electricidad(db: Session = Depends(get_db), _admin: bool = Dep
 BINANCE_PAY_ID = "748095851"
 
 @app.post("/electricidad/solicitar_paquete")
-def solicitar_paquete(usuario_id: str, paquete_id: str, cantidad_rigs: int, password: str = None, db: Session = Depends(get_db)):
-    verificar_usuario(usuario_id, password, db)
+def solicitar_paquete(usuario_id: str, paquete_id: str, cantidad_rigs: int, password: str = None,
+                       usar_cupon: bool = False, db: Session = Depends(get_db)):
+    usuario = verificar_usuario(usuario_id, password, db)
     if paquete_id not in PAQUETES_ELECTRICIDAD:
         raise HTTPException(400, "Paquete inválido")
     paquete = PAQUETES_ELECTRICIDAD[paquete_id]
@@ -399,13 +572,18 @@ def solicitar_paquete(usuario_id: str, paquete_id: str, cantidad_rigs: int, pass
     if cantidad_rigs <= 0 or cantidad_rigs > total_esp32:
         raise HTTPException(400, f"Cantidad inválida (tenés {total_esp32} ESP32 conectados)")
 
-    costo_total_usdt = round(paquete["precio_usdt_por_esp32"] * cantidad_rigs, 2)
+    subtotal = paquete["precio_usdt_por_esp32"] * cantidad_rigs
+    cupon_aplicado = False
+    if usar_cupon and cupon_vigente(usuario):
+        subtotal -= subtotal * (usuario.cupon_porcentaje / 100)
+        cupon_aplicado = True
+    costo_total_usdt = round(subtotal, 2)
     orden_id = f"elec_{usuario_id}_{uuid.uuid4().hex[:10]}"
 
     orden = OrdenElectricidad(
         id=orden_id, usuario_id=usuario_id, paquete_id=paquete_id,
         cantidad_rigs=cantidad_rigs, dias_por_rig=paquete["dias"],
-        monto_usdt=costo_total_usdt, estado="pendiente_revision",
+        monto_usdt=costo_total_usdt, cupon_aplicado=cupon_aplicado, estado="pendiente_revision",
     )
     db.add(orden)
     db.commit()
@@ -414,6 +592,7 @@ def solicitar_paquete(usuario_id: str, paquete_id: str, cantidad_rigs: int, pass
         "orden_id": orden_id,
         "binance_pay_id": BINANCE_PAY_ID,
         "monto_a_pagar_usdt": costo_total_usdt,
+        "cupon_aplicado": cupon_aplicado,
         "rigs_afectados": cantidad_rigs,
         "dias_por_rig": paquete["dias"],
         "siguiente_paso": "Sube el comprobante con /electricidad/subir_comprobante",
@@ -440,6 +619,39 @@ async def subir_comprobante(orden_id: str, file: UploadFile = File(...), db: Ses
     return {"status": "comprobante_recibido", "orden_id": orden_id}
 
 
+def calcular_cooldown_juego(db: Session, usuario_id: str, juego: str) -> dict:
+    """Cuántas partidas seguidas lleva el usuario en este juego sin rotar a otro, y si
+    todavía tiene que esperar para que la próxima pague tickets/oro completos."""
+    ultimas = (
+        db.query(PartidaMinijuego)
+        .filter_by(usuario_id=usuario_id)
+        .order_by(PartidaMinijuego.fecha.desc())
+        .limit(10)
+        .all()
+    )
+    racha = 0
+    for p in ultimas:
+        if p.juego == juego:
+            racha += 1
+        else:
+            break
+
+    indice = min(racha, len(COOLDOWN_MINIJUEGO_ESCALADA_SEGUNDOS) - 1)
+    segundos_requeridos = COOLDOWN_MINIJUEGO_ESCALADA_SEGUNDOS[indice]
+    segundos_restantes = 0
+    if racha > 0 and segundos_requeridos > 0:
+        transcurridos = (datetime.utcnow() - ultimas[0].fecha).total_seconds()
+        segundos_restantes = max(0, segundos_requeridos - transcurridos)
+
+    return {
+        "juego": juego,
+        "racha_actual": racha,
+        "segundos_requeridos": segundos_requeridos,
+        "segundos_restantes": round(segundos_restantes),
+        "puede_jugar": segundos_restantes <= 0,
+    }
+
+
 # ---------- SILK ARCADE: mini-juegos que dan Oro + Tickets ----------
 @app.get("/minijuegos/catalogo")
 def catalogo_minijuegos():
@@ -447,24 +659,17 @@ def catalogo_minijuegos():
         "juegos": [{"id": jid, **info} for jid, info in JUEGOS_DISPONIBLES.items()],
         "oro_por_nivel": MINIJUEGOS_ORO_POR_NIVEL,
         "niveles_por_ticket": MINIJUEGOS_NIVELES_POR_TICKET,
-        "partidas_diarias_max": MINIJUEGOS_PARTIDAS_DIARIAS_MAX,
+        "cooldown_escalada_segundos": COOLDOWN_MINIJUEGO_ESCALADA_SEGUNDOS,
     }
 
 
 @app.get("/minijuegos/estado")
-def estado_minijuegos(usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+def estado_minijuegos(usuario_id: str, password: str = None, juego: str = None, db: Session = Depends(get_db)):
     usuario = verificar_usuario(usuario_id, password, db)
-    hoy = datetime.utcnow().date()
-    partidas_hoy = (
-        db.query(PartidaMinijuego)
-        .filter(PartidaMinijuego.usuario_id == usuario_id, func.date(PartidaMinijuego.fecha) == hoy)
-        .count()
-    )
-    return {
-        "tickets_saldo": usuario.tickets_saldo,
-        "partidas_hoy": partidas_hoy,
-        "partidas_restantes": max(0, MINIJUEGOS_PARTIDAS_DIARIAS_MAX - partidas_hoy),
-    }
+    resultado = {"tickets_saldo": usuario.tickets_saldo}
+    if juego:
+        resultado["cooldown"] = calcular_cooldown_juego(db, usuario_id, juego)
+    return resultado
 
 
 @app.post("/minijuegos/registrar_partida")
@@ -479,14 +684,9 @@ def registrar_partida_minijuego(
     if nivel_alcanzado < 1:
         raise HTTPException(400, "nivel_alcanzado inválido")
 
-    hoy = datetime.utcnow().date()
-    partidas_hoy = (
-        db.query(PartidaMinijuego)
-        .filter(PartidaMinijuego.usuario_id == usuario_id, func.date(PartidaMinijuego.fecha) == hoy)
-        .count()
-    )
-    if partidas_hoy >= MINIJUEGOS_PARTIDAS_DIARIAS_MAX:
-        return {"status": "limite_diario_alcanzado", "oro_ganado": 0, "tickets_ganados": 0}
+    cooldown = calcular_cooldown_juego(db, usuario_id, juego)
+    if not cooldown["puede_jugar"]:
+        raise HTTPException(429, f"Cooldown activo en {juego} — esperá {cooldown['segundos_restantes']}s o cambiá de juego")
 
     # Anti-bot simple: si reportan un nivel alto en muy poco tiempo, se rechaza la partida entera
     minimo_esperado = nivel_alcanzado * MINIJUEGOS_SEGUNDOS_MIN_POR_NIVEL
@@ -506,10 +706,13 @@ def registrar_partida_minijuego(
     ))
     db.commit()
 
+    # Cooldown que le queda a ESTE juego para la próxima vez (ya cuenta la partida recién jugada)
+    cooldown_siguiente = calcular_cooldown_juego(db, usuario_id, juego)
+
     return {
         "status": "ok", "oro_ganado": oro_ganado, "tickets_ganados": tickets_ganados,
         "tickets_saldo": usuario.tickets_saldo, "oro_saldo": usuario.oro_saldo,
-        "partidas_restantes": max(0, MINIJUEGOS_PARTIDAS_DIARIAS_MAX - (partidas_hoy + 1)),
+        "cooldown": cooldown_siguiente,
     }
 
 
@@ -528,6 +731,24 @@ def canjear_tienda(usuario_id: str, password: str, item_id: str, db: Session = D
     if usuario.tickets_saldo < item["costo_tickets"]:
         raise HTTPException(400, "Tickets insuficientes")
 
+    if item["tipo"] == "electricidad":
+        ahora = datetime.utcnow()
+        es_semana_nueva = (
+            usuario.electricidad_tickets_semana_inicio is None
+            or ahora - usuario.electricidad_tickets_semana_inicio > timedelta(days=7)
+        )
+        if es_semana_nueva:
+            usuario.electricidad_tickets_semana_inicio = ahora
+            usuario.electricidad_tickets_dias_semana = 0
+
+        if usuario.electricidad_tickets_dias_semana + item["dias"] > ELECTRICIDAD_TICKETS_DIAS_MAX_SEMANA:
+            dias_disponibles = max(0, ELECTRICIDAD_TICKETS_DIAS_MAX_SEMANA - usuario.electricidad_tickets_dias_semana)
+            raise HTTPException(
+                400,
+                f"Tope semanal de electricidad por tickets alcanzado — te quedan {dias_disponibles} días "
+                f"disponibles esta semana (los tickets alcanzan para sostener 1 rig por semana, no para escalar)."
+            )
+
     usuario.tickets_saldo -= item["costo_tickets"]
     resultado = {"status": "canjeado", "item": item["nombre"], "tickets_saldo": usuario.tickets_saldo}
 
@@ -541,6 +762,7 @@ def canjear_tienda(usuario_id: str, password: str, item_id: str, db: Session = D
         if not rig:
             raise HTTPException(400, "No tenés dispositivos activos para acreditar electricidad")
         rig.dias_electricidad_prepagados += item["dias"]
+        usuario.electricidad_tickets_dias_semana += item["dias"]
         resultado["dispositivo"] = rig.mac
         resultado["dias_acreditados"] = item["dias"]
 
@@ -695,6 +917,11 @@ def aprobar_orden(orden_id: str, db: Session = Depends(get_db), _admin: bool = D
     )
     for rig in rigs:
         rig.dias_electricidad_prepagados += orden.dias_por_rig
+
+    usuario = db.get(Usuario, orden.usuario_id)
+    if orden.cupon_aplicado:
+        usuario.cupon_usado = True
+    generar_cupon_si_corresponde(usuario, orden.cupon_aplicado)
 
     orden.estado = "aprobada"
     orden.fecha_revision = datetime.utcnow()
@@ -1105,6 +1332,56 @@ def reclamar_mision(usuario_id: str, mision_id: str, password: str = None, db: S
     return {"status": "ok", "oro_ganado": mision["recompensa_oro"], "oro_saldo": usuario.oro_saldo}
 
 
+# ---------- COMUNIDAD: estado de la racha de login diario ----------
+@app.get("/comunidad/racha/{usuario_id}")
+def racha_usuario(usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+    usuario = verificar_usuario(usuario_id, password, db)
+    hoy = datetime.utcnow().strftime("%Y-%m-%d")
+    ya_reclamo_hoy = usuario.racha_ultimo_reclamo == hoy
+    dia_actual = usuario.racha_dia_actual or 1
+    return {
+        "dia_actual": dia_actual,
+        "ya_reclamo_hoy": ya_reclamo_hoy,
+        "tabla": RECOMPENSAS_RACHA,
+    }
+
+
+# ---------- COMUNIDAD: reclamar recompensa de racha de login diario ----------
+@app.post("/comunidad/racha/reclamar")
+def reclamar_racha(usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+    usuario = verificar_usuario(usuario_id, password, db)
+    hoy_dt = datetime.utcnow()
+    hoy = hoy_dt.strftime("%Y-%m-%d")
+    ayer = (hoy_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    if usuario.racha_ultimo_reclamo == hoy:
+        raise HTTPException(400, "Ya reclamaste tu racha de hoy")
+
+    # Si el último reclamo fue ayer, la racha continúa; si no (o nunca reclamó), arranca de nuevo en día 1
+    if usuario.racha_ultimo_reclamo == ayer:
+        dia_actual = (usuario.racha_dia_actual or 1)
+    else:
+        dia_actual = 1
+
+    recompensa = next((r for r in RECOMPENSAS_RACHA if r["dia"] == dia_actual), RECOMPENSAS_RACHA[0])
+    usuario.oro_saldo += recompensa["oro"]
+    usuario.tickets_saldo += recompensa["tickets"]
+    usuario.racha_ultimo_reclamo = hoy
+    # Tras el día 7, la próxima vuelve a empezar en el día 1
+    usuario.racha_dia_actual = dia_actual + 1 if dia_actual < len(RECOMPENSAS_RACHA) else 1
+    db.commit()
+
+    return {
+        "status": "ok",
+        "dia_reclamado": dia_actual,
+        "oro_ganado": recompensa["oro"],
+        "tickets_ganados": recompensa["tickets"],
+        "oro_saldo": usuario.oro_saldo,
+        "tickets_saldo": usuario.tickets_saldo,
+        "proximo_dia": usuario.racha_dia_actual,
+    }
+
+
 # ---------- COMUNIDAD: feed de anuncios globales (logros importantes, eventos) ----------
 @app.get("/comunidad/chat")
 def chat_global(limite: int = 30, db: Session = Depends(get_db)):
@@ -1377,11 +1654,19 @@ def perfil(usuario_id: str, password: str = None, db: Session = Depends(get_db))
     sin_asignar = [esp32_dict(r) for r in dispositivos if r.rig_id is None]
     certificados_sueltos = db.query(CertificadoInstalado).filter_by(usuario_id=usuario_id, rig_id=None).all()
 
+    cupon = None
+    if cupon_vigente(usuario):
+        cupon = {
+            "activo": True, "usado": False,
+            "porcentaje": usuario.cupon_porcentaje, "motivo": usuario.cupon_motivo,
+        }
+
     return {
         "usuario": usuario.nombre,
         "oro_saldo": usuario.oro_saldo,
         "tickets_saldo": usuario.tickets_saldo,
         "nivel": calcular_nivel(usuario.oro_historico)["nombre"],
+        "cupon": cupon,
         "minerales": {m.mineral: m.cantidad for m in minerales},
         "piezas": [p.pieza_id for p in piezas],
         "certificados_sin_equipar": [
