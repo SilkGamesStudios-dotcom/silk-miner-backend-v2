@@ -150,6 +150,20 @@ LOGROS = {
     "suscriptor_vip":{"nombre": "Suscriptor Fiel", "descripcion": "Activar VIP en algún rig",             "campo": "vip",           "valor": 1},
 }
 
+# ---------- RACHA DE LOGIN DIARIO (recompensa por entrar seguido, ciclo de 7 días) ----------
+# Se reclama una vez al día. Si el usuario reclama en días calendario consecutivos, avanza al
+# siguiente día de la racha; si se salta un día, vuelve a empezar en el día 1. Al completar el
+# día 7 y reclamar, el siguiente reclamo vuelve a arrancar en el día 1.
+RECOMPENSAS_RACHA = [
+    {"dia": 1, "oro": 100,  "tickets": 0},
+    {"dia": 2, "oro": 200,  "tickets": 0},
+    {"dia": 3, "oro": 0,    "tickets": 5},
+    {"dia": 4, "oro": 400,  "tickets": 0},
+    {"dia": 5, "oro": 0,    "tickets": 10},
+    {"dia": 6, "oro": 800,  "tickets": 0},
+    {"dia": 7, "oro": 2000, "tickets": 15},
+]
+
 # ---------- MISIONES DIARIAS (se resetean solas cada día, según shares minados hoy) ----------
 MISIONES_DIARIAS = [
     {"id": "mision_5",  "nombre": "Minar 5 shares hoy",  "shares_requeridos": 5,  "recompensa_oro": 200},
@@ -167,7 +181,7 @@ RECOMPENSA_POR_SHARE = 1000.0  # placeholder inicial, se recalcula con el cron s
 
 META_ORO_SEMANAL = 50_000_000 * 24 * 7  # meta total de emisión de la red por semana
 
-COSTO_DIARIO_USDT = 0.01
+COSTO_DIARIO_USDT = 0.05
 ROTACION_JOB_SEGUNDOS = 25  # alineado a que un share tarde ~25s en promedio
 
 # ---------- ELECTRICIDAD GRATIS POR ENCUESTA (CPX Research) ----------
@@ -181,10 +195,11 @@ ENCUESTA_DIAS_ELECTRICIDAD = 1       # días de electricidad que otorga cada enc
 ENCUESTA_MAX_ESP32 = 1               # a cuántos dispositivos se les acredita por encuesta (el/los que menos días tengan)
 
 # Paquetes de electricidad prepagada (precio POR CADA ESP32 que tenga el usuario)
+# Escalados x5 junto con COSTO_DIARIO_USDT (0.01 -> 0.05), manteniendo el mismo % de descuento por volumen.
 PAQUETES_ELECTRICIDAD = {
-    "10_dias": {"dias": 10, "precio_usdt_por_esp32": 0.10},
-    "30_dias": {"dias": 30, "precio_usdt_por_esp32": 0.27},   # ~10% descuento
-    "90_dias": {"dias": 90, "precio_usdt_por_esp32": 0.75},   # ~17% descuento
+    "10_dias": {"dias": 10, "precio_usdt_por_esp32": 0.50},
+    "30_dias": {"dias": 30, "precio_usdt_por_esp32": 1.35},   # ~10% descuento
+    "90_dias": {"dias": 90, "precio_usdt_por_esp32": 3.75},   # ~17% descuento
 }
 
 
@@ -194,6 +209,53 @@ def calcular_nivel(oro_historico):
         if oro_historico >= nivel["oro_minado_min"]:
             nivel_actual = nivel
     return nivel_actual
+
+
+# ---------- TOPE SEMANAL: tickets solo alcanzan para sostener 1 rig (regla de oro) ----------
+# Aunque el usuario acumule miles de tickets jugando o comprándolos en el Mercado, el canje de
+# tickets->electricidad tiene techo semanal. 42 = 6 dispositivos x 7 días (1 rig completo, 1 semana).
+# Esto NO limita cuántos tickets puede tener o vender — solo cuánta electricidad puede "comprar" con
+# ellos por semana. Para un 2do rig en adelante, el único camino es USDT, Encuesta, u Oro+Tickets
+# (ver PRECIOS_RIG) — el canje de la tienda nunca abre hardware nuevo.
+ELECTRICIDAD_TICKETS_DIAS_MAX_SEMANA = 42
+
+# ---------- PRECIOS PARA ABRIR UN RIG NUEVO (2do en adelante — el 1ro siempre es gratis) ----------
+# "tickets" queda FIJO en todas las filas (según se definió) — nunca escala con el número de rig.
+# "oro" y "precio_usdt" sí escalan. El ancla real usada acá es la tasa de la tienda de canje
+# (TIENDA_CANJE: 6 tickets = 1 día de electricidad de 1 dispositivo = COSTO_DIARIO_USDT), así que
+# 500 tickets equivalen groso modo a ~83 días de electricidad de 1 equipo si se canjearan ahí —
+# un valor de esfuerzo consistente con pedirle bastante más que "unos días de luz" para abrir hardware nuevo.
+PRECIOS_RIG = {
+    2: {"precio_usdt": 0.20, "tickets": 500, "oro": 3000},
+    3: {"precio_usdt": 0.35, "tickets": 500, "oro": 6000},
+    4: {"precio_usdt": 0.55, "tickets": 500, "oro": 10000},
+}
+# Rig 5 en adelante se calcula en código (ver precio_rig() más abajo) sobre la última fila cargada.
+PRECIOS_RIG_INCREMENTO_USDT_POR_RIG = 0.25
+PRECIOS_RIG_INCREMENTO_ORO_POR_RIG = 5000
+
+
+def precio_rig(numero_rig: int) -> dict:
+    """Precio (USDT, tickets, oro) para abrir el rig #numero_rig. Rig 1 no tiene precio (gratis)."""
+    if numero_rig in PRECIOS_RIG:
+        return PRECIOS_RIG[numero_rig]
+    ultimo_definido = max(PRECIOS_RIG.keys())
+    base = PRECIOS_RIG[ultimo_definido]
+    pasos_extra = numero_rig - ultimo_definido
+    return {
+        "precio_usdt": round(base["precio_usdt"] + PRECIOS_RIG_INCREMENTO_USDT_POR_RIG * pasos_extra, 2),
+        "tickets": base["tickets"],  # fijo siempre
+        "oro": base["oro"] + PRECIOS_RIG_INCREMENTO_ORO_POR_RIG * pasos_extra,
+    }
+
+
+# ---------- CUPÓN DE SUBSIDIO (fidelización a quien paga completo en USDT) ----------
+# Al aprobarse una orden 100% USDT (electricidad o rig nuevo) SIN cupón aplicado, se le genera
+# automáticamente un cupón para su próxima recarga. Se aplica solo, sin código, y expira si no
+# se usa a tiempo (para que no quede dando vueltas indefinidamente en cuentas inactivas).
+CUPON_SUBSIDIO_PORCENTAJE = 10
+CUPON_SUBSIDIO_DIAS_VALIDEZ = 30
+CUPON_SUBSIDIO_MOTIVO = "Pagaste tu recarga completa la última vez"
 
 
 # ---------- MINI-JUEGOS (Silk Arcade) ----------
@@ -213,8 +275,12 @@ MINIJUEGOS_ORO_POR_NIVEL = 500
 # Cada cuántos niveles alcanzados se entrega 1 ticket (moneda de logro, para la tienda de canje / mercado)
 MINIJUEGOS_NIVELES_POR_TICKET = 4
 
-# Límite de partidas que cuentan para recompensa por día y por usuario (anti-farmeo)
-MINIJUEGOS_PARTIDAS_DIARIAS_MAX = 5
+# Ya no hay tope de partidas por día. En cambio, cada juego individual entra en un
+# cooldown corto si insistís sin rotar a otro — esto empuja a rotar entre los 4 juegos
+# (más impresiones publicitarias reales) en vez de limitar cuánto podés jugar en total.
+# Índice = cantidad de partidas seguidas jugadas en ESE juego sin cambiar a otro (0-based).
+# Ej: partida 1 y 2 en el mismo juego -> sin espera. Partida 3 -> 30s. Partida 4+ -> 60s (tope).
+COOLDOWN_MINIJUEGO_ESCALADA_SEGUNDOS = [0, 0, 30, 60]
 
 # Anti-bot simple: si el cliente reporta un nivel alto en muy poco tiempo, es sospechoso.
 # El backend exige que duracion_segundos >= nivel_alcanzado * este valor, o rechaza la partida.
