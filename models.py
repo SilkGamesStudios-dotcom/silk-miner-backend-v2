@@ -20,7 +20,9 @@ class Usuario(Base):
     __tablename__ = "usuarios"
     id = Column(String, primary_key=True)
     nombre = Column(String, unique=True)
-    password = Column(String, nullable=True)
+    password = Column(String, nullable=True)  # LEGADO: texto plano — se migra sola a hash en el próximo login de cada usuario, ver verificar_usuario()
+    password_hash = Column(String, nullable=True)
+    password_salt = Column(String, nullable=True)
     wallet = Column(String, nullable=True)
     whatsapp = Column(String, nullable=True)
     oro_saldo = Column(Float, default=0)
@@ -251,6 +253,8 @@ def _migrar_columnas_nuevas():
             ("fecha_actividad", "VARCHAR"),
             ("misiones_reclamadas_hoy", "VARCHAR DEFAULT ''"),
             ("whatsapp", "VARCHAR"),
+            ("password_hash", "VARCHAR"),
+            ("password_salt", "VARCHAR"),
             ("tickets_saldo", "FLOAT DEFAULT 0"),
             ("cupon_activo", "BOOLEAN DEFAULT FALSE"),
             ("cupon_usado", "BOOLEAN DEFAULT TRUE"),
