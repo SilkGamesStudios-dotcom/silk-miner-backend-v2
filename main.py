@@ -1,4 +1,4 @@
-import hashlib, random, uuid, json, os
+import hashlib, hmac, random, uuid, json, os
 from datetime import datetime, timedelta
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Header, WebSocket, WebSocketDisconnect
@@ -38,18 +38,49 @@ def verificar_admin(x_admin_password: str = Header(None)):
     return True
 
 
+def _hash_password(password: str, salt: str = None) -> tuple:
+    """PBKDF2-HMAC-SHA256, 200.000 iteraciones, salt aleatorio por usuario. Sin dependencias
+    externas (bcrypt/passlib) — todo con la librería estándar de Python."""
+    salt = salt or os.urandom(16).hex()
+    derivado = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 200_000)
+    return derivado.hex(), salt
+
+
+def _password_coincide(password: str, hash_guardado: str, salt: str) -> bool:
+    derivado, _ = _hash_password(password, salt)
+    return hmac.compare_digest(derivado, hash_guardado)
+
+
 def verificar_usuario(usuario_id: str, password: str, db: Session) -> Usuario:
-    """Si el usuario no tiene password todavía, la primera que mande queda fijada.
-    Si ya tiene una, debe coincidir."""
+    """Contraseñas guardadas con PBKDF2-HMAC-SHA256 + salt (nunca en texto plano).
+    Si el usuario no tiene password todavía, la primera que mande queda fijada (hasheada).
+    Si ya tiene una, debe coincidir.
+    Migración en caliente: si la cuenta es de antes de este cambio (tiene el campo `password`
+    viejo en texto plano pero no `password_hash`), se valida contra el texto plano UNA vez y,
+    si coincide, se hashea ahí mismo y se borra el texto plano — sin que el usuario note nada
+    ni tenga que hacer un paso extra."""
     usuario = db.get(Usuario, usuario_id)
     if not usuario:
         raise HTTPException(404, "Usuario no existe")
     if not password:
         raise HTTPException(401, "Falta password")
-    if usuario.password is None:
-        usuario.password = password
+
+    if usuario.password_hash is None and usuario.password is None:
+        # cuenta nueva: la primera password que manda queda fijada
+        usuario.password_hash, usuario.password_salt = _hash_password(password)
         db.commit()
-    elif usuario.password != password:
+        return usuario
+
+    if usuario.password_hash is None and usuario.password is not None:
+        # cuenta vieja (texto plano) — migración en caliente
+        if usuario.password != password:
+            raise HTTPException(401, "Password incorrecta")
+        usuario.password_hash, usuario.password_salt = _hash_password(password)
+        usuario.password = None
+        db.commit()
+        return usuario
+
+    if not _password_coincide(password, usuario.password_hash, usuario.password_salt):
         raise HTTPException(401, "Password incorrecta")
     return usuario
 
@@ -218,17 +249,15 @@ def register_rig(mac: str, usuario_id: str, password: str, nombre: str = None, d
 
     usuario = db.get(Usuario, usuario_id)
     if not usuario:
-        # Cuenta nueva: la contraseña queda fijada en el mismo instante en que se crea,
-        # sin ventana de tiempo en la que otro pueda "robarla" fijando la suya primero.
-        usuario = Usuario(id=usuario_id, nombre=nombre or usuario_id, oro_saldo=0, oro_historico=0, password=password)
+        # Cuenta nueva: la contraseña queda fijada (hasheada) en el mismo instante en que se
+        # crea, sin ventana de tiempo en la que otro pueda "robarla" fijando la suya primero.
+        password_hash, password_salt = _hash_password(password)
+        usuario = Usuario(id=usuario_id, nombre=nombre or usuario_id, oro_saldo=0, oro_historico=0,
+                           password_hash=password_hash, password_salt=password_salt)
         db.add(usuario)
         db.commit()
-    elif usuario.password is None:
-        # Cuenta creada antes de este arreglo (sin password todavía): se fija ahora.
-        usuario.password = password
-        db.commit()
-    elif usuario.password != password:
-        raise HTTPException(401, "Password incorrecta: esta cuenta ya tiene dueño")
+    else:
+        verificar_usuario(usuario_id, password, db)  # misma lógica de hash/migración que el resto del sistema
 
     if db.get(Rig, mac):
         raise HTTPException(400, "MAC ya registrada")
@@ -981,6 +1010,23 @@ def ver_comprobante(orden_id: str, x_admin_password: str = None, db: Session = D
 
 
 # ---------- ADMIN: aprobar orden (acredita días) ----------
+# ---------- ADMIN: resetear contraseña (recuperación de cuenta asistida) ----------
+# No hay email ni SMS en este sistema, así que la recuperación de contraseña es manual: el
+# usuario prueba su identidad por WhatsApp/chat con soporte (fuera de la app) y un admin resetea
+# acá. La cuenta no se bloquea nunca por esto — solo cambia la contraseña.
+@app.post("/admin/resetear_password")
+def admin_resetear_password(usuario_id: str, nueva_password: str, db: Session = Depends(get_db), _admin: bool = Depends(verificar_admin)):
+    usuario = db.get(Usuario, usuario_id)
+    if not usuario:
+        raise HTTPException(404, "Usuario no existe")
+    if not nueva_password or len(nueva_password) < 4:
+        raise HTTPException(400, "La contraseña nueva es muy corta")
+    usuario.password_hash, usuario.password_salt = _hash_password(nueva_password)
+    usuario.password = None  # por si venía de una cuenta vieja sin migrar
+    db.commit()
+    return {"status": "ok", "usuario_id": usuario_id}
+
+
 @app.post("/admin/aprobar_orden")
 def aprobar_orden(orden_id: str, db: Session = Depends(get_db), _admin: bool = Depends(verificar_admin)):
     orden = db.get(OrdenElectricidad, orden_id)
