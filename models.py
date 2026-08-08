@@ -42,9 +42,14 @@ class Usuario(Base):
     electricidad_tickets_semana_inicio = Column(DateTime, nullable=True)
     electricidad_tickets_dias_semana = Column(Integer, default=0)  # días de electricidad ya canjeados con tickets esta semana
 
-    # ---- Racha de login diario (recompensa por entrar seguido, ver reglas.RECOMPENSAS_RACHA) ----
-    racha_dia_actual = Column(Integer, default=1)          # próximo día de racha a reclamar (1-7)
-    racha_ultimo_reclamo = Column(String, nullable=True)    # "YYYY-MM-DD" del último reclamo (evita reclamar 2 veces el mismo día)
+    # ---- Misiones semanales (ver reglas.MISIONES_SEMANALES) ----
+    semana_mision_inicio = Column(DateTime, nullable=True)          # arranque de la semana actual de misiones
+    contadores_semana = Column(JSON, default=dict)                  # {"partidas_jugadas": 3, "ordenes_compradas": 1, ...}
+    misiones_semanales_reclamadas = Column(String, default="")      # ids de misión semanal ya cobrados esta semana, separados por coma
+
+    # ---- Racha de login diario (ver reglas.RACHA_RECOMPENSAS) ----
+    racha_dia_actual = Column(Integer, default=1)             # día del ciclo de 7 en el que está parado
+    racha_ultimo_reclamo = Column(DateTime, nullable=True)    # último reclamo — si fue ayer, avanza; si fue hoy, ya reclamó; si fue antes de ayer, se resetea a día 1
 
 
 class RigGrupo(Base):
@@ -66,6 +71,10 @@ class Rig(Base):
     fecha_ultimo_descuento = Column(DateTime, default=datetime.utcnow)
     fecha_registro = Column(DateTime, default=datetime.utcnow)
     experiencia = Column(Float, default=0)  # XP propia del dispositivo (ESP32 o celular)
+
+    # ---- Buff de XP activo (comprado con Oro en la tienda de Oro, ver reglas.BUFFS_XP_ORO) ----
+    buff_xp_multiplicador = Column(Float, default=1.0)   # 1.0 = sin buff activo
+    buff_xp_expira_en = Column(DateTime, nullable=True)  # si es pasado respecto a ahora, el buff ya venció
 
 
 class MineralInventario(Base):
@@ -231,7 +240,11 @@ def _migrar_columnas_nuevas():
     Usa el inspector de SQLAlchemy en vez de "PRAGMA table_info" (SQLite-only) para
     que la migración funcione igual en Postgres (Render) que en SQLite (local/dev)."""
     columnas_nuevas = {
-        "rigs": [("experiencia", "FLOAT DEFAULT 0")],
+        "rigs": [
+            ("experiencia", "FLOAT DEFAULT 0"),
+            ("buff_xp_multiplicador", "FLOAT DEFAULT 1.0"),
+            ("buff_xp_expira_en", "TIMESTAMP"),
+        ],
         "rig_grupos": [("vip_hasta", "TIMESTAMP")],
         "usuarios": [
             ("shares_hoy", "INTEGER DEFAULT 0"),
@@ -247,8 +260,11 @@ def _migrar_columnas_nuevas():
             ("cupon_expira_en", "TIMESTAMP"),
             ("electricidad_tickets_semana_inicio", "TIMESTAMP"),
             ("electricidad_tickets_dias_semana", "INTEGER DEFAULT 0"),
+            ("semana_mision_inicio", "TIMESTAMP"),
+            ("contadores_semana", "JSON"),
+            ("misiones_semanales_reclamadas", "VARCHAR DEFAULT ''"),
             ("racha_dia_actual", "INTEGER DEFAULT 1"),
-            ("racha_ultimo_reclamo", "VARCHAR"),
+            ("racha_ultimo_reclamo", "TIMESTAMP"),
         ],
         "ordenes_electricidad": [("cupon_aplicado", "BOOLEAN DEFAULT FALSE")],
     }
