@@ -90,36 +90,78 @@ NIVELES = [
 
 # ---------- NIVELES POR DISPOSITIVO (experiencia individual de cada ESP32/celular) ----------
 # Cada share exitoso suma XP al dispositivo que lo mandó. Al subir de nivel, ese
-# dispositivo produce más Oro (buff_oro se suma al resto de buffs en /submit).
+# dispositivo produce más Oro (buff_oro se suma al resto de buffs en /submit) — es
+# la forma en que "sube de nivel" un minero, tipo MMORPG: no cambia el hashrate físico
+# real (eso lo manda el hardware), pero sí cuánto Oro vale cada prueba que resuelve.
+#
+# Va de Nivel 1 a Nivel 10000 (NIVEL_MAX_DISPOSITIVO). La curva de XP se arma por
+# tramos, cada uno más lento que el anterior — a propósito no es gratis subir:
+#   Niveles 1-10:      igual que el sistema original (rápido, ~35 días 1 solo device 24/7).
+#   Niveles 11-100:    +3% de XP por nivel — ronda el año de juego real para llegar.
+#   Niveles 101-1000:  +0.3% de XP por nivel — años de juego, ya requiere varios devices.
+#   Niveles 1001-10000: +0.05% de XP por nivel — end-game: en la práctica solo se
+#                       acerca alguien combinando VARIOS dispositivos + VIP + los
+#                       buffs de XP de BUFFS_XP_ORO (se compran EXCLUSIVAMENTE con
+#                       Oro farmeado, no con tickets ni USDT — así el nivel más alto
+#                       siempre se gana jugando/minando, nunca se compra directo).
+# El buff de Oro también crece por tramos, con techo duro en +160% para que nunca
+# se vuelva absurdo pagar por share, ni siquiera en Nivel 10000.
 XP_POR_SHARE = 1.0
+NIVEL_MAX_DISPOSITIVO = 10000
 
-NIVELES_DISPOSITIVO = [
-    {"nombre": "Nivel 1", "xp_min": 0,     "buff_oro": 0.00},
-    {"nombre": "Nivel 2", "xp_min": 200,   "buff_oro": 0.01},
-    {"nombre": "Nivel 3", "xp_min": 600,   "buff_oro": 0.02},
-    {"nombre": "Nivel 4", "xp_min": 1500,  "buff_oro": 0.04},
-    {"nombre": "Nivel 5", "xp_min": 3500,  "buff_oro": 0.06},
-    {"nombre": "Nivel 6", "xp_min": 7500,  "buff_oro": 0.09},
-    {"nombre": "Nivel 7", "xp_min": 15000, "buff_oro": 0.12},
-    {"nombre": "Nivel 8", "xp_min": 30000, "buff_oro": 0.16},
-    {"nombre": "Nivel 9", "xp_min": 60000, "buff_oro": 0.20},
-    {"nombre": "Nivel 10","xp_min": 120000,"buff_oro": 0.25},
-]
+
+def _generar_niveles_dispositivo():
+    xp = [0, 200, 600, 1500, 3500, 7500, 15000, 30000, 60000, 120000]           # niveles 1-10
+    buff = [0.00, 0.01, 0.02, 0.04, 0.06, 0.09, 0.12, 0.16, 0.20, 0.25]          # niveles 1-10
+
+    for _ in range(11, 101):                                                     # niveles 11-100
+        xp.append(round(xp[-1] * 1.03))
+        buff.append(round(buff[-1] + 0.005, 5))
+    for _ in range(101, 1001):                                                   # niveles 101-1000
+        xp.append(round(xp[-1] * 1.003))
+        buff.append(round(buff[-1] + 0.0005, 5))
+    for _ in range(1001, NIVEL_MAX_DISPOSITIVO + 1):                             # niveles 1001-10000
+        xp.append(round(xp[-1] * 1.0005))
+        buff.append(round(min(buff[-1] + 0.00005, 1.60), 5))
+
+    return [
+        {"nombre": f"Nivel {n}", "xp_min": xp[n - 1], "buff_oro": buff[n - 1]}
+        for n in range(1, NIVEL_MAX_DISPOSITIVO + 1)
+    ]
+
+
+# Se genera UNA sola vez al importar el módulo (10.000 filas, trivial en memoria) y
+# se busca por bisección en cada share — nunca se recalcula ni se recorre en loop.
+NIVELES_DISPOSITIVO = _generar_niveles_dispositivo()
+_NIVELES_DISPOSITIVO_XP_MIN = [n["xp_min"] for n in NIVELES_DISPOSITIVO]
 
 
 def calcular_nivel_dispositivo(experiencia):
-    nivel_actual = NIVELES_DISPOSITIVO[0]
-    for nivel in NIVELES_DISPOSITIVO:
-        if experiencia >= nivel["xp_min"]:
-            nivel_actual = nivel
-    return nivel_actual
+    import bisect
+    i = bisect.bisect_right(_NIVELES_DISPOSITIVO_XP_MIN, experiencia) - 1
+    i = max(0, min(i, len(NIVELES_DISPOSITIVO) - 1))
+    return NIVELES_DISPOSITIVO[i]
 
 
 def siguiente_nivel_dispositivo(experiencia):
-    for nivel in NIVELES_DISPOSITIVO:
-        if experiencia < nivel["xp_min"]:
-            return nivel
-    return None  # ya está en el nivel máximo
+    import bisect
+    i = bisect.bisect_right(_NIVELES_DISPOSITIVO_XP_MIN, experiencia)
+    if i >= len(NIVELES_DISPOSITIVO):
+        return None  # ya está en Nivel 10000, el tope
+    return NIVELES_DISPOSITIVO[i]
+
+
+# ---------- BUFFS DE EXPERIENCIA (se compran EXCLUSIVAMENTE con Oro — nunca con tickets ni USDT) ----------
+# Multiplican la XP que gana UN dispositivo específico por share mientras estén activos.
+# Es la única forma de acelerar la subida de nivel más allá de jugar/minar — pensado para
+# quien ya farmeó bastante Oro y lo quiere reinvertir en progreso, no para comprar nivel
+# directo con dinero real. Se aplican a un rig (mac) elegido por el usuario a la vez.
+BUFFS_XP_ORO = {
+    "xp_x2_24h": {"nombre": "Doble Experiencia — 24 horas",  "multiplicador": 2.0, "duracion_horas": 24,  "costo_oro": 50_000},
+    "xp_x2_72h": {"nombre": "Doble Experiencia — 3 días",    "multiplicador": 2.0, "duracion_horas": 72,  "costo_oro": 130_000},
+    "xp_x3_24h": {"nombre": "Triple Experiencia — 24 horas", "multiplicador": 3.0, "duracion_horas": 24,  "costo_oro": 90_000},
+    "xp_x3_72h": {"nombre": "Triple Experiencia — 3 días",   "multiplicador": 3.0, "duracion_horas": 72,  "costo_oro": 230_000},
+}
 
 
 # ---------- VIP PREMIUM (suscripción mensual por rig completo, pago manual en USDT) ----------
@@ -150,24 +192,76 @@ LOGROS = {
     "suscriptor_vip":{"nombre": "Suscriptor Fiel", "descripcion": "Activar VIP en algún rig",             "campo": "vip",           "valor": 1},
 }
 
-# ---------- RACHA DE LOGIN DIARIO (recompensa por entrar seguido, ciclo de 7 días) ----------
-# Se reclama una vez al día. Si el usuario reclama en días calendario consecutivos, avanza al
-# siguiente día de la racha; si se salta un día, vuelve a empezar en el día 1. Al completar el
-# día 7 y reclamar, el siguiente reclamo vuelve a arrancar en el día 1.
-RECOMPENSAS_RACHA = [
-    {"dia": 1, "oro": 100,  "tickets": 0},
-    {"dia": 2, "oro": 200,  "tickets": 0},
-    {"dia": 3, "oro": 0,    "tickets": 5},
-    {"dia": 4, "oro": 400,  "tickets": 0},
-    {"dia": 5, "oro": 0,    "tickets": 10},
-    {"dia": 6, "oro": 800,  "tickets": 0},
-    {"dia": 7, "oro": 2000, "tickets": 15},
+# ---------- MISIONES DIARIAS (se resetean solas cada día, según shares minados hoy) ----------
+# ---------- RACHA DE LOGIN DIARIO (ciclo de 7 días, se reinicia si se salta un día) ----------
+# Cada día que el usuario reclama, avanza un día en el ciclo. Si se salta un día entero sin
+# reclamar, el ciclo vuelve al día 1 — no hay perdón por inactividad, así se mantiene el valor
+# de la racha. Cada día del ciclo da Oro o Tickets (nunca los dos), y el día 7 es el más grande
+# a propósito, como cierre del ciclo antes de reiniciar.
+RACHA_RECOMPENSAS = [
+    {"dia": 1, "oro": 300,  "tickets": 0},
+    {"dia": 2, "oro": 600,  "tickets": 0},
+    {"dia": 3, "oro": 0,    "tickets": 3},
+    {"dia": 4, "oro": 1200, "tickets": 0},
+    {"dia": 5, "oro": 0,    "tickets": 6},
+    {"dia": 6, "oro": 2500, "tickets": 0},
+    {"dia": 7, "oro": 0,    "tickets": 15},
 ]
 
-# ---------- MISIONES DIARIAS (se resetean solas cada día, según shares minados hoy) ----------
 MISIONES_DIARIAS = [
     {"id": "mision_5",  "nombre": "Minar 5 shares hoy",  "shares_requeridos": 5,  "recompensa_oro": 200},
     {"id": "mision_20", "nombre": "Minar 20 shares hoy", "shares_requeridos": 20, "recompensa_oro": 1000},
+]
+
+# ---------- MISIONES SEMANALES (se resetean solas cada 7 días, cubren TODO el ecosistema) ----------
+# A diferencia de las diarias (solo shares), estas empujan a usar la plataforma entera: jugar
+# Arcade, tradear en el Mercado, comprar electricidad (con USDT o con Tickets), craftear,
+# completar encuestas y abrir rigs nuevos. Las recompensas son Oro y Tickets — ambos se pueden
+# vender en el Mercado a otros jugadores, así que toda misión termina alimentando el trade.
+#
+# A propósito NO son fáciles — "reto equilibrado" quiere decir que algunas se completan en un
+# par de días si jugás fuerte, y otras están pensadas para toda la semana. Nada se regala: el
+# usuario que no toca la plataforma en toda la semana simplemente no cobra nada, y eso es
+# correcto — no hay premio por no jugar.
+#
+# "metrica" es la clave del contador semanal (ver Usuario.contadores_semana en models.py) que
+# se compara contra "objetivo" para saber si la misión está completa.
+MISIONES_SEMANALES = [
+    # --- Arcade (jugar) — 3 escalones de dificultad sobre el mismo contador ---
+    {"id": "sem_arcade_20",  "nombre": "Jugador de la semana",  "descripcion": "Jugá 20 partidas de Silk Arcade (cualquier combinación de juegos).",
+     "metrica": "partidas_jugadas", "objetivo": 20,  "recompensa_oro": 6_000,   "recompensa_tickets": 8},
+    {"id": "sem_arcade_150", "nombre": "Maratón de Arcade",     "descripcion": "Jugá 150 partidas de Silk Arcade esta semana.",
+     "metrica": "partidas_jugadas", "objetivo": 150, "recompensa_oro": 45_000,  "recompensa_tickets": 60},
+    {"id": "sem_arcade_500", "nombre": "Leyenda del Arcade",    "descripcion": "Jugá 500 partidas de Silk Arcade esta semana — el reto grande.",
+     "metrica": "partidas_jugadas", "objetivo": 500, "recompensa_oro": 160_000, "recompensa_tickets": 220},
+
+    # --- Mercado (tradear) ---
+    {"id": "sem_mercado_comprar_5",  "nombre": "Comprador activo",  "descripcion": "Comprá 5 órdenes publicadas por otros jugadores en el Mercado.",
+     "metrica": "ordenes_compradas", "objetivo": 5,  "recompensa_oro": 8_000,  "recompensa_tickets": 10},
+    {"id": "sem_mercado_comprar_20", "nombre": "Trader de la semana", "descripcion": "Comprá 20 órdenes en el Mercado esta semana.",
+     "metrica": "ordenes_compradas", "objetivo": 20, "recompensa_oro": 32_000, "recompensa_tickets": 40},
+    {"id": "sem_mercado_publicar_10", "nombre": "Vendedor activo", "descripcion": "Publicá 10 órdenes de venta en el Mercado (minerales, tickets, piezas o certificados).",
+     "metrica": "ordenes_publicadas", "objetivo": 10, "recompensa_oro": 9_000, "recompensa_tickets": 12},
+    {"id": "sem_mercado_volumen_50k", "nombre": "Movés la economía", "descripcion": "Acumulá 50.000 de Oro en volumen tradeado en el Mercado (comprando y/o vendiendo).",
+     "metrica": "volumen_oro_tradeado", "objetivo": 50_000, "recompensa_oro": 18_000, "recompensa_tickets": 25},
+
+    # --- Electricidad (USDT y Tickets — ambos caminos cuentan, y a propósito ambos tienen misión) ---
+    {"id": "sem_energia_usdt_1", "nombre": "Inversor de la semana", "descripcion": "Comprá al menos 1 paquete de electricidad pagado en USDT.",
+     "metrica": "electricidad_compras_usdt", "objetivo": 1, "recompensa_oro": 7_000, "recompensa_tickets": 15},
+    {"id": "sem_energia_tickets_3", "nombre": "Autosuficiente", "descripcion": "Canjeá electricidad con Tickets 3 veces esta semana (tienda de canje).",
+     "metrica": "electricidad_compras_tickets", "objetivo": 3, "recompensa_oro": 5_000, "recompensa_tickets": 0},
+
+    # --- Crafteo ---
+    {"id": "sem_crafteo_5", "nombre": "Manos a la obra", "descripcion": "Crafteá 5 piezas para tus rigs.",
+     "metrica": "piezas_crafteadas", "objetivo": 5, "recompensa_oro": 7_500, "recompensa_tickets": 10},
+
+    # --- Encuestas (CPX — electricidad gratis, la plataforma también gana por esto) ---
+    {"id": "sem_encuestas_3", "nombre": "Explorador de ofertas", "descripcion": "Completá 3 encuestas de CPX Research.",
+     "metrica": "encuestas_completadas", "objetivo": 3, "recompensa_oro": 12_000, "recompensa_tickets": 20},
+
+    # --- Expansión (abrir hardware nuevo) ---
+    {"id": "sem_rig_nuevo_1", "nombre": "Expansión", "descripcion": "Pagá y abrí un rig nuevo esta semana (2do en adelante).",
+     "metrica": "rigs_comprados", "objetivo": 1, "recompensa_oro": 25_000, "recompensa_tickets": 50},
 ]
 
 
@@ -182,7 +276,61 @@ RECOMPENSA_POR_SHARE = 1000.0  # placeholder inicial, se recalcula con el cron s
 META_ORO_SEMANAL = 50_000_000 * 24 * 7  # meta total de emisión de la red por semana
 
 COSTO_DIARIO_USDT = 0.05
-ROTACION_JOB_SEGUNDOS = 25  # alineado a que un share tarde ~25s en promedio
+ROTACION_JOB_SEGUNDOS = 25  # alineado a que un share tarde ~25s en promedio (ESP32 genérico / celular)
+
+# ---------- MINEROS OFICIALES SILK MINER v1 (roadmap — todavía no hay hardware real vendido) ----------
+# Decisión de diseño para cuando exista el hardware: el dispositivo oficial resuelve un hash
+# cada ~18s en vez de ~25s. IMPORTANTE — cómo se implementa esto CORRECTAMENTE cuando llegue el
+# momento (para que sea trabajo real, no una promesa vacía ni un multiplicador de recompensa
+# disfrazado):
+#   NO se logra bajando la dificultad (cumple_dificultad cuenta ceros hexadecimales enteros —
+#   cada paso de dificultad multiplica x16 la dureza, es un salto demasiado grosero para afinar
+#   una reducción del 28% con precisión).
+#   SÍ se logra dándole a los dispositivos oficiales su PROPIO ciclo de rotación de job (su
+#   propio prev_hash, misma dificultad que todos), rotando cada 18s en vez de cada 25s — el
+#   mismo mecanismo que ROTACION_JOB_SEGUNDOS, pero en un carril aparte solo para el modelo
+#   oficial. Sigue siendo hash real, SHA-256 real, el chip real resolviendo — solo que su
+#   ventana de tiempo para intentarlo es más corta, así que si el chip ya resuelve cómodo
+#   dentro de 25s (como hoy), resolver en 18s es 100% verificable y nunca una simulación.
+# Esto requiere identificar el dispositivo como oficial en el registro (campo de modelo en Rig)
+# antes de servirle un job en este carril — no implementado todavía porque el hardware no existe
+# aún; queda documentado acá para cuando se construya el endpoint real.
+SILK_MINER_OFICIAL_ROTACION_SEGUNDOS = 18
+
+# Carril intermedio: un ESP32 genérico armado por un reseller, pero corriendo firmware con
+# LICENCIA paga (activada, atada a su MAC) — tiene prioridad sobre un dispositivo sin licencia,
+# pero no tanta como el hardware oficial (que además vino calibrado y probado en fábrica). Así
+# el orden de incentivos queda: sin licencia (gratis, 25s) < licenciado (paga la licencia +
+# cuota, 21s) < Silk Miner oficial (compra el hardware, incluye licencia, 18s) — cada escalón
+# se paga con algo real y da algo real a cambio.
+LICENCIADO_GENERICO_ROTACION_SEGUNDOS = 21
+
+# ---------- CUOTA DE MANTENIMIENTO MENSUAL (roadmap — para TODO dispositivo con licencia activa) ----------
+# Tanto un Silk Miner oficial como un ESP32 de un reseller con licencia paga tienen que sostener
+# una cuota mensual para mantener su carril de prioridad (18s o 21s). Se paga en Oro o en
+# Tickets — NUNCA en USDT, a propósito: Oro y Tickets son saldo interno, así que el cobro es
+# 100% automático (se descuenta solo, sin que ningún admin tenga que aprobar nada a mano cada
+# mes). Esto es intencional: ya vimos que una cuota mensual en USDT significaría aprobar a mano
+# ~12 pagos al año por cada dispositivo — inviable a escala. En Oro/Tickets no hay ese problema,
+# y de paso le mete más movimiento real a esas dos monedas (que es justo lo que se buscaba).
+#
+# Precio calculado sobre el ancla de ESFUERZO real del juego (no el ancla de USDT que usa la
+# Tienda): jugar Arcade da Oro y Tickets de la MISMA jugada — 8 niveles alcanzados dan 4.000 Oro
+# Y 1 Ticket a la vez (ver MINIJUEGOS_ORO_POR_NIVEL y MINIJUEGOS_NIVELES_POR_TICKET). Esa es la
+# tasa real de "cuánto cuesta ganar" cada moneda jugando: 1 Ticket ~ 4.000 Oro de esfuerzo. La
+# cuota en Tickets se redondea siempre HACIA ARRIBA sobre esa equivalencia — igual que con USDT,
+# pagar con el recurso más escaso nunca sale más barato en esfuerzo real.
+CUOTA_MANTENIMIENTO_ORO_MENSUAL = 15_000
+CUOTA_MANTENIMIENTO_TICKETS_MENSUAL = 4  # 15.000 / 4.000 = 3.75 -> redondeado arriba
+
+# Interruptor por dispositivo: "auto" descuenta la cuota sola cada mes (de Oro primero, o de
+# Tickets si el jugador lo configuró así) apenas se cumple el mes, sin que el jugador haga nada.
+# "manual" espera a que el jugador la pague él mismo desde su panel.
+# Si la cuota vence y NO se pagó (ni en automático por falta de saldo, ni a mano): el dispositivo
+# NO se bloquea ni deja de minar — solo pierde el carril de prioridad y vuelve al ritmo estándar
+# de 25s hasta que se pague de nuevo. La activación anti-clonación de la licencia (MAC atada) es
+# perpetua y no se toca — lo único que depende de la cuota es la velocidad extra.
+CUOTA_MANTENIMIENTO_MODOS = ["auto", "manual"]
 
 # ---------- ELECTRICIDAD GRATIS POR ENCUESTA (CPX Research) ----------
 # Al completar una encuesta/oferta en CPX, el usuario recibe 1 día de electricidad
@@ -272,8 +420,12 @@ JUEGOS_DISPONIBLES = {
 # Oro que se entrega por nivel alcanzado en cualquier mini-juego (nivel_alcanzado * este valor)
 MINIJUEGOS_ORO_POR_NIVEL = 500
 
-# Cada cuántos niveles alcanzados se entrega 1 ticket (moneda de logro, para la tienda de canje / mercado)
-MINIJUEGOS_NIVELES_POR_TICKET = 4
+# Cada cuántos niveles alcanzados se entrega 1 ticket (moneda de logro, para la tienda de canje / mercado).
+# Antes era 4 — se subió a 8 (mitad de tickets por el mismo juego) a propósito: el Oro por nivel
+# no cambia, pero el ticket tiene que sentirse ganado. Esto también protege el ancla de precios que
+# usa Tickets como medio de pago (ver LICENCIA_SOFTWARE_* más abajo): si tickets salieran demasiado
+# fácil, pagar con tiempo jugado terminaría siendo más barato que pagar con USDT, y nadie pagaría.
+MINIJUEGOS_NIVELES_POR_TICKET = 8
 
 # Ya no hay tope de partidas por día. En cambio, cada juego individual entra en un
 # cooldown corto si insistís sin rotar a otro — esto empuja a rotar entre los 4 juegos
@@ -287,16 +439,24 @@ COOLDOWN_MINIJUEGO_ESCALADA_SEGUNDOS = [0, 0, 30, 60]
 MINIJUEGOS_SEGUNDOS_MIN_POR_NIVEL = 8
 
 # ---------- TIENDA DE CANJE (Gift Shop — se paga solo con Tickets) ----------
+# REGLA GENERAL DE PRECIOS (aplica a todo lo que tenga un equivalente directo en USDT en
+# la plataforma): el precio en Tickets siempre es el equivalente en USDT convertido al
+# ancla real de la economía (1 ticket ≈ $0.0083, ver LICENCIA_SOFTWARE_* más abajo) MÁS
+# UN 35% extra. Nunca 1:1. Así pagar con tiempo jugado nunca sale más barato que pagar con
+# USDT — el camino en tickets siempre cuesta más en términos reales, aunque no cueste
+# dinero. Esto no aplica a piezas/certificados de la tienda: esos no tienen un precio en
+# USDT en la plataforma (se ganan farmeando o crafteando), así que no hay equivalente
+# contra el cual calcular el +35%.
 TIENDA_CANJE = {
     "canje_electricidad_1": {
         "nombre": "1 día de electricidad (1 dispositivo)",
-        "costo_tickets": 6,
+        "costo_tickets": 8,   # equivalente USDT $0.05 -> ancla 6 tickets, +35% = 8.1 -> 8
         "tipo": "electricidad",
         "dias": 1,
     },
     "canje_electricidad_3": {
         "nombre": "3 días de electricidad (1 dispositivo)",
-        "costo_tickets": 15,
+        "costo_tickets": 24,  # equivalente USDT $0.15 -> ancla 18 tickets, +35% = 24.3 -> 24
         "tipo": "electricidad",
         "dias": 3,
     },
@@ -325,3 +485,13 @@ TIENDA_CANJE = {
         "certificado_id": "certificado_plata",
     },
 }
+
+# ---------- LICENCIA DE SOFTWARE (roadmap — sistema anti-clonación, ver white paper de licencias) ----------
+# PRÓXIMAMENTE: todavía no hay endpoints ni tabla para esto, son solo las constantes de precio
+# ya definidas para cuando se implemente. Ancla real del valor de 1 ticket: $0.05 USDT / 6 =
+# $0.0083 (el mismo peg que usa toda la economía de Tickets, aunque el precio EN LA TIENDA ya
+# incluya su propio +35%, ver TIENDA_CANJE). A ese ancla, la licencia saldría en 480 tickets
+# 1:1 — a propósito NO se deja así: lleva el mismo +35% que toda compra con Tickets, para que
+# pagar con tiempo jugado nunca salga más barato que pagar con USDT.
+LICENCIA_SOFTWARE_PRECIO_USDT = 4.0
+LICENCIA_SOFTWARE_PRECIO_TICKETS = 650  # ancla (480) + 35%, redondeado
