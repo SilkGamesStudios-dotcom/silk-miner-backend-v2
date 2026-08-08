@@ -16,12 +16,14 @@ from reglas import (
     XP_POR_SHARE, calcular_nivel_dispositivo, siguiente_nivel_dispositivo,
     VIP_PRECIO_USDT_MES, VIP_DIAS_POR_PAGO, VIP_BUFF_ORO, VIP_BUFF_DROP,
     CERTIFICADOS, COMISION_MERCADO_CERTIFICADOS,
-    LOGROS, MISIONES_DIARIAS, RECOMPENSAS_RACHA,
+    RACHA_RECOMPENSAS,
+    LOGROS, MISIONES_DIARIAS, MISIONES_SEMANALES,
     ENCUESTA_DIAS_ELECTRICIDAD, ENCUESTA_MAX_ESP32,
     JUEGOS_DISPONIBLES, MINIJUEGOS_ORO_POR_NIVEL, MINIJUEGOS_NIVELES_POR_TICKET,
     COOLDOWN_MINIJUEGO_ESCALADA_SEGUNDOS, MINIJUEGOS_SEGUNDOS_MIN_POR_NIVEL, TIENDA_CANJE,
     ELECTRICIDAD_TICKETS_DIAS_MAX_SEMANA, PRECIOS_RIG, precio_rig,
     CUPON_SUBSIDIO_PORCENTAJE, CUPON_SUBSIDIO_DIAS_VALIDEZ, CUPON_SUBSIDIO_MOTIVO,
+    BUFFS_XP_ORO,
 )
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "SilkAdmin41")
@@ -92,6 +94,32 @@ def revisar_logros_oro(db: Session, usuario: Usuario):
     for logro_id, logro in LOGROS.items():
         if logro["campo"] == "oro_historico" and usuario.oro_historico >= logro["valor"]:
             otorgar_logro_si_corresponde(db, usuario, logro_id)
+
+
+# ---------- MISIONES SEMANALES: contadores por usuario (ver reglas.MISIONES_SEMANALES) ----------
+def _asegurar_semana_vigente(usuario: Usuario):
+    """Si pasaron 7+ días desde que arrancó la semana de misiones de este usuario (o nunca
+    arrancó), resetea contadores y reclamos. Se llama siempre antes de leer o incrementar,
+    igual que el patrón ya usado para electricidad_tickets_semana_inicio."""
+    ahora = datetime.utcnow()
+    semana_vencida = (
+        usuario.semana_mision_inicio is None
+        or ahora - usuario.semana_mision_inicio > timedelta(days=7)
+    )
+    if semana_vencida:
+        usuario.semana_mision_inicio = ahora
+        usuario.contadores_semana = {}
+        usuario.misiones_semanales_reclamadas = ""
+
+
+def _incrementar_contador_semana(usuario: Usuario, metrica: str, cantidad: float = 1):
+    """Suma `cantidad` al contador `metrica` de la semana actual del usuario. Reasigna el
+    dict entero (en vez de mutar in-place) para que SQLAlchemy detecte el cambio en la
+    columna JSON y lo guarde al hacer commit."""
+    _asegurar_semana_vigente(usuario)
+    contadores = dict(usuario.contadores_semana or {})
+    contadores[metrica] = contadores.get(metrica, 0) + cantidad
+    usuario.contadores_semana = contadores
 
 
 def evento_activo_actual(db: Session):
@@ -392,6 +420,7 @@ def aprobar_orden_rig(orden_id: str, db: Session = Depends(get_db), _admin: bool
 
     orden.estado = "aprobada"
     orden.fecha_revision = datetime.utcnow()
+    _incrementar_contador_semana(usuario, "rigs_comprados", 1)
     db.commit()
     return {"status": "aprobada", "rig_id": grupo.id, "mac_asignado": orden.mac_pendiente}
 
@@ -477,7 +506,16 @@ def submit_share(mac: str, job_id: str, nonce: int, hash_result: str, db: Sessio
     recompensa = estado_recompensa["valor"] * (1 + buff)
     usuario.oro_saldo += recompensa
     usuario.oro_historico += recompensa
-    rig.experiencia += XP_POR_SHARE
+
+    # Buff de XP activo (comprado con Oro, ver /tienda_oro): multiplica la XP de ESTE share.
+    # Si ya venció, se limpia solo acá (lazy) sin necesitar un cron aparte.
+    xp_multiplicador = 1.0
+    if rig.buff_xp_expira_en and rig.buff_xp_expira_en > datetime.utcnow():
+        xp_multiplicador = rig.buff_xp_multiplicador
+    elif rig.buff_xp_expira_en:
+        rig.buff_xp_multiplicador = 1.0
+        rig.buff_xp_expira_en = None
+    rig.experiencia += XP_POR_SHARE * xp_multiplicador
 
     # Si el dispositivo acaba de cruzar el umbral de un certificado, se lo otorgamos
     # (una sola vez por dispositivo — se controla con origen_mac).
@@ -700,6 +738,9 @@ def registrar_partida_minijuego(
     usuario.oro_historico += oro_ganado
     usuario.tickets_saldo += tickets_ganados
 
+    _incrementar_contador_semana(usuario, "partidas_jugadas", 1)
+    _incrementar_contador_semana(usuario, "niveles_totales", nivel_alcanzado)
+
     db.add(PartidaMinijuego(
         usuario_id=usuario_id, juego=juego, nivel_alcanzado=nivel_alcanzado,
         duracion_segundos=duracion_segundos, oro_ganado=oro_ganado, tickets_ganados=tickets_ganados,
@@ -765,6 +806,7 @@ def canjear_tienda(usuario_id: str, password: str, item_id: str, db: Session = D
         usuario.electricidad_tickets_dias_semana += item["dias"]
         resultado["dispositivo"] = rig.mac
         resultado["dias_acreditados"] = item["dias"]
+        _incrementar_contador_semana(usuario, "electricidad_compras_tickets", 1)
 
     elif item["tipo"] == "pieza_random":
         opciones = [pid for pid, r in RECETAS.items() if pid.endswith(f"_{item['tier']}")]
@@ -788,6 +830,44 @@ def canjear_tienda(usuario_id: str, password: str, item_id: str, db: Session = D
 
     db.commit()
     return resultado
+
+
+# ---------- TIENDA DE ORO (buffs de XP — se paga EXCLUSIVAMENTE con Oro, nunca tickets ni USDT) ----------
+@app.get("/tienda_oro/catalogo")
+def catalogo_tienda_oro():
+    return {"buffs": [{"id": bid, **info} for bid, info in BUFFS_XP_ORO.items()]}
+
+
+@app.post("/tienda_oro/comprar_buff_xp")
+def comprar_buff_xp(usuario_id: str, password: str, buff_id: str, mac: str, db: Session = Depends(get_db)):
+    usuario = verificar_usuario(usuario_id, password, db)
+    buff = BUFFS_XP_ORO.get(buff_id)
+    if not buff:
+        raise HTTPException(404, "Buff no encontrado")
+
+    rig = db.get(Rig, mac)
+    if not rig or rig.usuario_id != usuario_id:
+        raise HTTPException(404, "Dispositivo no encontrado en tu cuenta")
+
+    if usuario.oro_saldo < buff["costo_oro"]:
+        raise HTTPException(400, "Oro insuficiente")
+
+    ahora = datetime.utcnow()
+    # Si ya tiene un buff activo, el nuevo se apila SUMANDO tiempo (no se pisa ni se desperdicia),
+    # pero el multiplicador nunca se combina entre buffs distintos — gana el más alto de los dos.
+    base = rig.buff_xp_expira_en if (rig.buff_xp_expira_en and rig.buff_xp_expira_en > ahora) else ahora
+    rig.buff_xp_expira_en = base + timedelta(hours=buff["duracion_horas"])
+    rig.buff_xp_multiplicador = max(rig.buff_xp_multiplicador if rig.buff_xp_expira_en > ahora else 1.0, buff["multiplicador"])
+
+    usuario.oro_saldo -= buff["costo_oro"]
+    db.commit()
+
+    return {
+        "status": "comprado", "buff": buff["nombre"], "dispositivo": mac,
+        "multiplicador_activo": rig.buff_xp_multiplicador,
+        "expira_en": rig.buff_xp_expira_en.isoformat(),
+        "oro_saldo": usuario.oro_saldo,
+    }
 
 
 # ---------- WEBHOOK CPX RESEARCH: postback al completar/revertir una encuesta ----------
@@ -867,6 +947,7 @@ def webhook_cpx(
         rigs_recargados=",".join(r.mac for r in rigs), dias_por_rig=ENCUESTA_DIAS_ELECTRICIDAD,
         estado="acreditada",
     ))
+    _incrementar_contador_semana(usuario, "encuestas_completadas", 1)
     registrar_anuncio(db, f"🎁 Un minero completó una encuesta y ganó {ENCUESTA_DIAS_ELECTRICIDAD} días de electricidad gratis")
     db.commit()
 
@@ -925,6 +1006,7 @@ def aprobar_orden(orden_id: str, db: Session = Depends(get_db), _admin: bool = D
 
     orden.estado = "aprobada"
     orden.fecha_revision = datetime.utcnow()
+    _incrementar_contador_semana(usuario, "electricidad_compras_usdt", 1)
     db.commit()
 
     return {"status": "aprobada", "rigs_recargados": len(rigs), "dias_agregados_por_rig": orden.dias_por_rig}
@@ -1060,7 +1142,7 @@ def rechazar_orden_vip(orden_id: str, db: Session = Depends(get_db), _admin: boo
 # ---------- CRAFTEO ----------
 @app.post("/craftear")
 def craftear(usuario_id: str, receta_id: str, password: str = None, db: Session = Depends(get_db)):
-    verificar_usuario(usuario_id, password, db)
+    usuario = verificar_usuario(usuario_id, password, db)
     if receta_id not in RECETAS:
         raise HTTPException(400, "Receta inválida")
     receta = RECETAS[receta_id]
@@ -1078,6 +1160,7 @@ def craftear(usuario_id: str, receta_id: str, password: str = None, db: Session 
         usuario_id=usuario_id, pieza_id=receta_id, slot=receta["slot"],
         rig_id=None, durabilidad_actual=receta["durabilidad_max"],
     ))
+    _incrementar_contador_semana(usuario, "piezas_crafteadas", 1)
     db.commit()
     return {"status": "ok", "pieza": receta_id, "buff": receta["buff_hashrate"]}
 
@@ -1085,7 +1168,7 @@ def craftear(usuario_id: str, receta_id: str, password: str = None, db: Session 
 # ---------- MERCADO ----------
 @app.post("/mercado/publicar")
 def publicar_orden(usuario_id: str, tipo_item: str, item_id: str, cantidad: int, precio_oro: float, password: str = None, db: Session = Depends(get_db)):
-    verificar_usuario(usuario_id, password, db)
+    usuario = verificar_usuario(usuario_id, password, db)
     if precio_oro <= 0 or cantidad <= 0:
         raise HTTPException(400, "Cantidad/precio inválidos")
 
@@ -1095,8 +1178,7 @@ def publicar_orden(usuario_id: str, tipo_item: str, item_id: str, cantidad: int,
             raise HTTPException(400, "Inventario insuficiente")
         inv.cantidad -= cantidad  # se reserva restando ya (simplificado)
     elif tipo_item == "ticket":
-        usuario = db.get(Usuario, usuario_id)
-        if not usuario or usuario.tickets_saldo < cantidad:
+        if usuario.tickets_saldo < cantidad:
             raise HTTPException(400, "Tickets insuficientes")
         usuario.tickets_saldo -= cantidad  # se reserva restando ya, igual que un mineral
     elif tipo_item == "pieza":
@@ -1125,6 +1207,7 @@ def publicar_orden(usuario_id: str, tipo_item: str, item_id: str, cantidad: int,
     orden = OrdenMercado(usuario_id=usuario_id, tipo_item=tipo_item, item_id=item_id,
                          cantidad=cantidad, precio_oro=precio_oro, estado="abierta")
     db.add(orden)
+    _incrementar_contador_semana(usuario, "ordenes_publicadas", 1)
     db.commit()
     return {"status": "publicada", "orden_id": orden.id}
 
@@ -1173,6 +1256,9 @@ def comprar_orden(usuario_id: str, orden_id: int, password: str = None, db: Sess
         cert.rig_id = None
 
     orden.estado = "completada"
+    _incrementar_contador_semana(comprador, "ordenes_compradas", 1)
+    _incrementar_contador_semana(comprador, "volumen_oro_tradeado", orden.precio_oro)
+    _incrementar_contador_semana(vendedor, "volumen_oro_tradeado", orden.precio_oro)
     db.commit()
     return {"status": "ok"}
 
@@ -1332,53 +1418,100 @@ def reclamar_mision(usuario_id: str, mision_id: str, password: str = None, db: S
     return {"status": "ok", "oro_ganado": mision["recompensa_oro"], "oro_saldo": usuario.oro_saldo}
 
 
-# ---------- COMUNIDAD: estado de la racha de login diario ----------
+# ---------- COMUNIDAD: racha de login diario (ver reglas.RACHA_RECOMPENSAS) ----------
 @app.get("/comunidad/racha/{usuario_id}")
 def racha_usuario(usuario_id: str, password: str = None, db: Session = Depends(get_db)):
     usuario = verificar_usuario(usuario_id, password, db)
-    hoy = datetime.utcnow().strftime("%Y-%m-%d")
-    ya_reclamo_hoy = usuario.racha_ultimo_reclamo == hoy
-    dia_actual = usuario.racha_dia_actual or 1
+    ahora = datetime.utcnow()
+    ya_reclamo_hoy = bool(usuario.racha_ultimo_reclamo and usuario.racha_ultimo_reclamo.date() == ahora.date())
     return {
-        "dia_actual": dia_actual,
+        "tabla": RACHA_RECOMPENSAS,
+        "dia_actual": usuario.racha_dia_actual or 1,
         "ya_reclamo_hoy": ya_reclamo_hoy,
-        "tabla": RECOMPENSAS_RACHA,
     }
 
 
-# ---------- COMUNIDAD: reclamar recompensa de racha de login diario ----------
 @app.post("/comunidad/racha/reclamar")
 def reclamar_racha(usuario_id: str, password: str = None, db: Session = Depends(get_db)):
     usuario = verificar_usuario(usuario_id, password, db)
-    hoy_dt = datetime.utcnow()
-    hoy = hoy_dt.strftime("%Y-%m-%d")
-    ayer = (hoy_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    ahora = datetime.utcnow()
 
-    if usuario.racha_ultimo_reclamo == hoy:
-        raise HTTPException(400, "Ya reclamaste tu racha de hoy")
+    if usuario.racha_ultimo_reclamo and usuario.racha_ultimo_reclamo.date() == ahora.date():
+        raise HTTPException(400, "Ya reclamaste tu racha hoy")
 
-    # Si el último reclamo fue ayer, la racha continúa; si no (o nunca reclamó), arranca de nuevo en día 1
-    if usuario.racha_ultimo_reclamo == ayer:
-        dia_actual = (usuario.racha_dia_actual or 1)
-    else:
-        dia_actual = 1
+    # Si el último reclamo NO fue ayer (es decir, se saltó un día completo), el ciclo se reinicia.
+    if usuario.racha_ultimo_reclamo and usuario.racha_ultimo_reclamo.date() < (ahora - timedelta(days=2)).date():
+        usuario.racha_dia_actual = 1
+    dia_actual = usuario.racha_dia_actual or 1
 
-    recompensa = next((r for r in RECOMPENSAS_RACHA if r["dia"] == dia_actual), RECOMPENSAS_RACHA[0])
-    usuario.oro_saldo += recompensa["oro"]
-    usuario.tickets_saldo += recompensa["tickets"]
-    usuario.racha_ultimo_reclamo = hoy
-    # Tras el día 7, la próxima vuelve a empezar en el día 1
-    usuario.racha_dia_actual = dia_actual + 1 if dia_actual < len(RECOMPENSAS_RACHA) else 1
+    premio = next(r for r in RACHA_RECOMPENSAS if r["dia"] == dia_actual)
+    usuario.oro_saldo += premio["oro"]
+    usuario.oro_historico += premio["oro"]
+    usuario.tickets_saldo += premio["tickets"]
+
+    usuario.racha_ultimo_reclamo = ahora
+    usuario.racha_dia_actual = 1 if dia_actual >= 7 else dia_actual + 1
     db.commit()
 
     return {
-        "status": "ok",
-        "dia_reclamado": dia_actual,
-        "oro_ganado": recompensa["oro"],
-        "tickets_ganados": recompensa["tickets"],
-        "oro_saldo": usuario.oro_saldo,
-        "tickets_saldo": usuario.tickets_saldo,
-        "proximo_dia": usuario.racha_dia_actual,
+        "status": "ok", "dia_reclamado": dia_actual,
+        "oro_ganado": premio["oro"], "tickets_ganados": premio["tickets"],
+        "oro_saldo": usuario.oro_saldo, "tickets_saldo": usuario.tickets_saldo,
+    }
+
+
+# ---------- COMUNIDAD: misiones SEMANALES del usuario (jugar, tradear, comprar luz, craftear...) ----------
+@app.get("/comunidad/misiones_semanales/{usuario_id}")
+def misiones_semanales_usuario(usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+    usuario = verificar_usuario(usuario_id, password, db)
+    _asegurar_semana_vigente(usuario)
+    db.commit()  # persiste el reset si esta llamada fue la que detectó que venció la semana
+
+    contadores = usuario.contadores_semana or {}
+    reclamadas = (usuario.misiones_semanales_reclamadas or "").split(",") if usuario.misiones_semanales_reclamadas else []
+    return {
+        "semana_inicio": usuario.semana_mision_inicio.isoformat() if usuario.semana_mision_inicio else None,
+        "misiones": [
+            {
+                "id": m["id"], "nombre": m["nombre"], "descripcion": m["descripcion"],
+                "objetivo": m["objetivo"], "progreso": min(contadores.get(m["metrica"], 0), m["objetivo"]),
+                "recompensa_oro": m["recompensa_oro"], "recompensa_tickets": m["recompensa_tickets"],
+                "completa": contadores.get(m["metrica"], 0) >= m["objetivo"],
+                "reclamada": m["id"] in reclamadas,
+            }
+            for m in MISIONES_SEMANALES
+        ],
+    }
+
+
+# ---------- COMUNIDAD: reclamar recompensa de una misión semanal ----------
+@app.post("/comunidad/misiones_semanales/reclamar")
+def reclamar_mision_semanal(usuario_id: str, mision_id: str, password: str = None, db: Session = Depends(get_db)):
+    usuario = verificar_usuario(usuario_id, password, db)
+    mision = next((m for m in MISIONES_SEMANALES if m["id"] == mision_id), None)
+    if not mision:
+        raise HTTPException(404, "Misión inválida")
+
+    _asegurar_semana_vigente(usuario)
+
+    contadores = usuario.contadores_semana or {}
+    if contadores.get(mision["metrica"], 0) < mision["objetivo"]:
+        raise HTTPException(400, "Todavía no completaste esta misión")
+
+    reclamadas = (usuario.misiones_semanales_reclamadas or "").split(",") if usuario.misiones_semanales_reclamadas else []
+    if mision_id in reclamadas:
+        raise HTTPException(400, "Ya reclamaste esta misión esta semana")
+
+    usuario.oro_saldo += mision["recompensa_oro"]
+    usuario.oro_historico += mision["recompensa_oro"]
+    usuario.tickets_saldo += mision["recompensa_tickets"]
+    reclamadas.append(mision_id)
+    usuario.misiones_semanales_reclamadas = ",".join(reclamadas)
+    db.commit()
+
+    return {
+        "status": "ok", "oro_ganado": mision["recompensa_oro"], "tickets_ganados": mision["recompensa_tickets"],
+        "oro_saldo": usuario.oro_saldo, "tickets_saldo": usuario.tickets_saldo,
     }
 
 
@@ -1959,4 +2092,3 @@ def desequipar_certificado(certificado_instalado_id: int, usuario_id: str, passw
     cert.rig_id = None
     db.commit()
     return {"status": "ok", "certificado_id": cert.id}
-
