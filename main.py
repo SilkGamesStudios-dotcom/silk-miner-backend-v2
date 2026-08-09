@@ -286,6 +286,39 @@ def renombrar_rig(mac: str, usuario_id: str, nuevo_nombre: str, password: str = 
     return {"status": "ok", "mac": mac, "nombre": rig.nombre}
 
 
+# ---------- ENCENDER / APAGAR un ESP32 puntual (interruptor manual, independiente de la luz) ----------
+# Tener días de electricidad prepagados NO alcanza para minar: el dispositivo también tiene que
+# estar encendido. Esto separa dos cosas reales: "¿tengo luz pagada?" (dias_electricidad) vs
+# "¿está prendido ahora mismo?" (activo). Comprar electricidad no prende nada solo — el usuario
+# tiene que encenderlo, igual que un aparato real.
+@app.post("/rig/encender")
+def encender_rig(mac: str, usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+    verificar_usuario(usuario_id, password, db)
+    rig = db.get(Rig, mac)
+    if not rig:
+        raise HTTPException(404, "Rig no encontrado")
+    if rig.usuario_id != usuario_id:
+        raise HTTPException(403, "Este rig no te pertenece")
+    if rig.dias_electricidad_prepagados <= 0:
+        raise HTTPException(400, "No podés encenderlo sin electricidad — recargá primero")
+    rig.activo = True
+    db.commit()
+    return {"status": "ok", "mac": mac, "activo": True}
+
+
+@app.post("/rig/apagar")
+def apagar_rig(mac: str, usuario_id: str, password: str = None, db: Session = Depends(get_db)):
+    verificar_usuario(usuario_id, password, db)
+    rig = db.get(Rig, mac)
+    if not rig:
+        raise HTTPException(404, "Rig no encontrado")
+    if rig.usuario_id != usuario_id:
+        raise HTTPException(403, "Este rig no te pertenece")
+    rig.activo = False
+    db.commit()
+    return {"status": "ok", "mac": mac, "activo": False}
+
+
 # ---------- AGRUPACIÓN: crear un rig (contenedor de hasta 6 ESP32) ----------
 @app.get("/rig/precio_siguiente")
 def precio_siguiente_rig(usuario_id: str, db: Session = Depends(get_db)):
@@ -491,6 +524,8 @@ def submit_share(mac: str, job_id: str, nonce: int, hash_result: str, db: Sessio
     rig = db.get(Rig, mac)
     if not rig or rig.dias_electricidad_prepagados <= 0:
         raise HTTPException(402, "Electricidad pendiente")
+    if not rig.activo:
+        raise HTTPException(403, "Minero apagado — encendelo desde el panel para minar")
     if job_id != current_job["job_id"]:
         raise HTTPException(400, "Job expirado")
     if mac in shares_por_job.get(job_id, set()):
@@ -1811,6 +1846,7 @@ def perfil(usuario_id: str, password: str = None, db: Session = Depends(get_db))
             "mac": r.mac, "nombre": r.nombre or r.mac, "activo": r.activo,
             "dias_electricidad": r.dias_electricidad_prepagados,
             "experiencia": r.experiencia, "nivel": nivel_disp["nombre"],
+            "xp_nivel_actual": nivel_disp["xp_min"],
             "buff_oro_nivel": nivel_disp["buff_oro"],
             "xp_siguiente_nivel": siguiente["xp_min"] if siguiente else None,
         }
