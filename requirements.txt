@@ -1,6 +1,7 @@
-fastapi
-uvicorn
-sqlalchemy
-python-multipart
-apscheduler
-requests
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy==2.0.36
+apscheduler==3.10.4
+psycopg2-binary==2.9.10
+python-multipart==0.0.20
+websockets==14.1
